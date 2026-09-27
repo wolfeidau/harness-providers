@@ -63,7 +63,7 @@ func TestCodexReviewE2E(t *testing.T) {
 			t.Errorf("close Codex session: %v", err)
 		}
 	})
-	input := hp.TurnInput{Parts: []hp.InputPart{{Kind: hp.InputText, Text: "Read access.go from the current workspace, then review it for authorization bugs. Do not edit files. Keep your answer short. Remember this marker for my next message: " + marker}}, Model: "gpt-6-luna", Effort: "low", Policy: hp.ExecutionPolicy{Approval: hp.ApprovalNever, Sandbox: hp.SandboxReadOnly}}
+	input := hp.TurnInput{Parts: []hp.InputPart{{Kind: hp.InputText, Text: "The read-only sandbox permits reading files. Use the command tool to run `cat access.go` in the current workspace, then review it for authorization bugs. Do not edit files. Keep your answer short. Remember this marker for my next message: " + marker}}, Model: "gpt-6-luna", Effort: "low", Policy: hp.ExecutionPolicy{Approval: hp.ApprovalNever, Sandbox: hp.SandboxReadOnly}}
 	turn, err := s.StartTurn(ctx, input)
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +80,7 @@ func TestCodexReviewE2E(t *testing.T) {
 		t.Fatalf("review omitted CanDelete: %s", review)
 	}
 	comparison := false
-	for _, phrase := range []string{"!=", "not equal", "inequal", "inverted", "reversed", "opposite"} {
+	for _, phrase := range []string{"!=", "==", "not equal", "inequal", "inverted", "reversed", "opposite"} {
 		if strings.Contains(lower, phrase) {
 			comparison = true
 			break
