@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	hp "github.com/wolfeidau/harness-providers"
 )
 
@@ -25,39 +26,27 @@ func TestCodexReviewE2E(t *testing.T) {
 	if os.Getenv("HARNESS_LIVE_TEST") != "1" {
 		t.Skip("set HARNESS_LIVE_TEST=1 to make model calls")
 	}
-	if _, err := exec.LookPath("codex"); err != nil {
-		t.Fatal("codex binary unavailable:", err)
-	}
+	_, err := exec.LookPath("codex")
+	require.NoError(t, err, "codex binary unavailable")
 	home := os.Getenv("HARNESS_TEST_CODEX_HOME")
 	if home == "" {
-		if os.Getenv("CODEX_ACCESS_TOKEN") == "" {
-			t.Fatal("set HARNESS_TEST_CODEX_HOME or CODEX_ACCESS_TOKEN; default Codex home is never used")
-		}
+		require.NotEmpty(t, os.Getenv("CODEX_ACCESS_TOKEN"), "set HARNESS_TEST_CODEX_HOME or CODEX_ACCESS_TOKEN; default Codex home is never used")
 		home = filepath.Join(t.TempDir(), "codex-home")
-		if err := os.Mkdir(home, 0700); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.Mkdir(home, 0700))
 	}
-	if err := checkLiveModel(t, home, "gpt-6-luna", "low"); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, checkLiveModel(t, home, "gpt-6-luna", "low"))
 	workspace := t.TempDir()
-	if err := os.WriteFile(filepath.Join(workspace, "access.go"), []byte("package access\n\nfunc CanDelete(actor, owner string) bool {\n return actor != owner\n}\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, "access.go"), []byte("package access\n\nfunc CanDelete(actor, owner string) bool {\n return actor != owner\n}\n"), 0600))
 	markerBytes := make([]byte, 8)
-	if _, err := rand.Read(markerBytes); err != nil {
-		t.Fatal(err)
-	}
+	_, err = rand.Read(markerBytes)
+	require.NoError(t, err)
 	marker := hex.EncodeToString(markerBytes)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	p := New(Config{Home: home, Logger: logger})
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 	defer cancel()
 	s, err := p.Open(ctx, hp.OpenRequest{WorkingDirectory: workspace})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() {
 		if err := s.Close(); err != nil {
 			t.Errorf("close Codex session: %v", err)
@@ -65,20 +54,12 @@ func TestCodexReviewE2E(t *testing.T) {
 	})
 	input := hp.TurnInput{Parts: []hp.InputPart{{Kind: hp.InputText, Text: "The read-only sandbox permits reading files. Use the command tool to run `cat access.go` in the current workspace, then review it for authorization bugs. Do not edit files. Keep your answer short. Remember this marker for my next message: " + marker}}, Model: "gpt-6-luna", Effort: "low", Policy: hp.ExecutionPolicy{Approval: hp.ApprovalNever, Sandbox: hp.SandboxReadOnly}}
 	turn, err := s.StartTurn(ctx, input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if turn.ID() == "" {
-		t.Fatal("empty turn ID")
-	}
+	require.NoError(t, err)
+	require.NotEmpty(t, turn.ID())
 	review, err := readLiveTurn(t, turn)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	lower := strings.ToLower(review)
-	if !strings.Contains(lower, "candelete") {
-		t.Fatalf("review omitted CanDelete: %s", review)
-	}
+	require.Contains(t, lower, "candelete", "review: %s", review)
 	comparison := false
 	for _, phrase := range []string{"!=", "==", "not equal", "inequal", "inverted", "reversed", "opposite"} {
 		if strings.Contains(lower, phrase) {
@@ -86,44 +67,26 @@ func TestCodexReviewE2E(t *testing.T) {
 			break
 		}
 	}
-	if !comparison {
-		t.Fatalf("review omitted inverted comparison: %s", review)
-	}
+	require.True(t, comparison, "review omitted inverted comparison: %s", review)
 	cursor := s.Cursor()
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, s.Close())
 	b, err := json.Marshal(cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	var restored hp.Cursor
-	if err = json.Unmarshal(b, &restored); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, json.Unmarshal(b, &restored))
 	s2, err := p.Open(ctx, hp.OpenRequest{WorkingDirectory: workspace, Resume: &restored})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	defer func() {
 		if err := s2.Close(); err != nil {
 			t.Errorf("close resumed Codex session: %v", err)
 		}
 	}()
-	if string(s2.Cursor().Data) != string(restored.Data) {
-		t.Fatal("resume changed native thread identity")
-	}
+	require.Equal(t, string(restored.Data), string(s2.Cursor().Data), "resume changed native thread identity")
 	turn2, err := s2.StartTurn(ctx, hp.TurnInput{Parts: []hp.InputPart{{Kind: hp.InputText, Text: "What was the exact marker in my previous message? Reply with only the marker."}}, Model: "gpt-6-luna", Effort: "low", Policy: hp.ExecutionPolicy{Approval: hp.ApprovalNever, Sandbox: hp.SandboxReadOnly}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	answer, err := readLiveTurn(t, turn2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(answer, marker) {
-		t.Fatalf("resume lost previous message marker: %q", answer)
-	}
+	require.NoError(t, err)
+	require.Contains(t, answer, marker, "resume lost previous message marker")
 }
 
 func checkLiveModel(t *testing.T, home, model, effort string) error {

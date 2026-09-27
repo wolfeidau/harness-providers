@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	hp "github.com/wolfeidau/harness-providers"
 )
 
@@ -107,14 +108,10 @@ func TestFakePeer(t *testing.T) {
 func fakeProvider(t *testing.T, scenario string) *Provider {
 	t.Helper()
 	bin, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	script := filepath.Join(t.TempDir(), "fake-codex")
 	content := "#!/bin/sh\nexec '" + strings.ReplaceAll(bin, "'", "'\\''") + "' -test.run=^TestFakePeer$\n"
-	if err = os.WriteFile(script, []byte(content), 0700); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.WriteFile(script, []byte(content), 0700))
 	return New(Config{Binary: script, Env: []string{"HARNESS_FAKE_PEER=1", "HARNESS_FAKE_SCENARIO=" + scenario}})
 }
 func contextForTest(t *testing.T) context.Context {
@@ -126,9 +123,7 @@ func contextForTest(t *testing.T) context.Context {
 func openFake(t *testing.T, scenario string) hp.Session {
 	t.Helper()
 	s, err := fakeProvider(t, scenario).Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() {
 		if err := s.Close(); err != nil {
 			t.Errorf("close fake session: %v", err)
@@ -139,20 +134,14 @@ func openFake(t *testing.T, scenario string) hp.Session {
 func startFake(t *testing.T, s hp.Session) hp.Turn {
 	t.Helper()
 	turn, err := s.StartTurn(contextForTest(t), hp.TurnInput{Parts: []hp.InputPart{{Kind: hp.InputText, Text: "hello"}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if turn.ID() != "turn-1" {
-		t.Fatalf("id=%q", turn.ID())
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "turn-1", turn.ID())
 	return turn
 }
 func next(t *testing.T, turn hp.Turn) hp.Event {
 	t.Helper()
 	e, err := turn.Next(contextForTest(t))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	return e
 }
 
@@ -160,26 +149,23 @@ func TestTurnEventsAndEarlyNotification(t *testing.T) {
 	for _, scenario := range []string{"normal", "early"} {
 		t.Run(scenario, func(t *testing.T) {
 			s := openFake(t, scenario)
-			if s.Cursor().Provider != "codex" {
-				t.Fatal(s.Cursor())
-			}
+			assert.Equal(t, "codex", s.Cursor().Provider)
 			turn := startFake(t, s)
 			var seen []hp.EventKind
 			for {
 				e := next(t, turn)
 				seen = append(seen, e.Kind)
 				if e.Kind == hp.EventTurnFinished {
-					if e.Outcome.Status != hp.OutcomeCompleted {
-						t.Fatal(e)
-					}
+					require.NotNil(t, e.Outcome)
+					assert.Equal(t, hp.OutcomeCompleted, e.Outcome.Status)
 					break
 				}
 			}
-			if _, err := turn.Next(contextForTest(t)); err != io.EOF {
-				t.Fatalf("want EOF: %v", err)
-			}
-			if scenario == "early" && seen[0] != hp.EventTurnStarted {
-				t.Fatalf("early event lost: %v", seen)
+			_, err := turn.Next(contextForTest(t))
+			require.ErrorIs(t, err, io.EOF)
+			if scenario == "early" {
+				require.NotEmpty(t, seen)
+				assert.Equal(t, hp.EventTurnStarted, seen[0])
 			}
 		})
 	}
@@ -188,45 +174,32 @@ func TestApprovalAndInterrupt(t *testing.T) {
 	s := openFake(t, "approval")
 	turn := startFake(t, s)
 	e := next(t, turn)
-	if e.Kind != hp.EventRequest {
-		t.Fatal(e)
-	}
-	if err := turn.Respond(contextForTest(t), e.Request.ID, hp.Response{OptionID: "decline"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := turn.Respond(contextForTest(t), e.Request.ID, hp.Response{OptionID: "decline"}); !errors.Is(err, hp.ErrRequestNotFound) {
-		t.Fatal(err)
-	}
-	if e = next(t, turn); e.Kind != hp.EventTurnFinished {
-		t.Fatal(e)
-	}
+	require.Equal(t, hp.EventRequest, e.Kind)
+	require.NotNil(t, e.Request)
+	require.NoError(t, turn.Respond(contextForTest(t), e.Request.ID, hp.Response{OptionID: "decline"}))
+	require.ErrorIs(t, turn.Respond(contextForTest(t), e.Request.ID, hp.Response{OptionID: "decline"}), hp.ErrRequestNotFound)
+	e = next(t, turn)
+	assert.Equal(t, hp.EventTurnFinished, e.Kind)
 	s2 := openFake(t, "pending")
 	turn2 := startFake(t, s2)
-	if _, err := s2.StartTurn(contextForTest(t), hp.TurnInput{Parts: []hp.InputPart{{Kind: hp.InputText, Text: "again"}}}); !errors.Is(err, hp.ErrBusy) {
-		t.Fatal(err)
-	}
-	if err := turn2.Interrupt(contextForTest(t)); err != nil {
-		t.Fatal(err)
-	}
-	if e = next(t, turn2); e.Outcome.Status != hp.OutcomeInterrupted {
-		t.Fatal(e)
-	}
+	_, err := s2.StartTurn(contextForTest(t), hp.TurnInput{Parts: []hp.InputPart{{Kind: hp.InputText, Text: "again"}}})
+	require.ErrorIs(t, err, hp.ErrBusy)
+	require.NoError(t, turn2.Interrupt(contextForTest(t)))
+	e = next(t, turn2)
+	require.NotNil(t, e.Outcome)
+	assert.Equal(t, hp.OutcomeInterrupted, e.Outcome.Status)
 }
 func TestExitAndResumeErrors(t *testing.T) {
 	s := openFake(t, "exit")
 	turn := startFake(t, s)
-	if _, err := turn.Next(contextForTest(t)); err == nil || err == io.EOF {
-		t.Fatalf("expected transport error: %v", err)
-	}
+	_, err := turn.Next(contextForTest(t))
+	require.Error(t, err)
+	require.NotErrorIs(t, err, io.EOF)
 	p := fakeProvider(t, "missing")
-	_, err := p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir(), Resume: &hp.Cursor{Provider: "codex", Version: 1, Data: json.RawMessage(`{"threadId":"thread-1"}`)}})
-	if !errors.Is(err, hp.ErrSessionNotFound) {
-		t.Fatal(err)
-	}
+	_, err = p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir(), Resume: &hp.Cursor{Provider: "codex", Version: 1, Data: json.RawMessage(`{"threadId":"thread-1"}`)}})
+	require.ErrorIs(t, err, hp.ErrSessionNotFound)
 	_, err = p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir(), Resume: &hp.Cursor{Provider: "claude", Version: 1, Data: json.RawMessage(`{}`)}})
-	if !errors.Is(err, hp.ErrInvalidCursor) {
-		t.Fatal(err)
-	}
+	require.ErrorIs(t, err, hp.ErrInvalidCursor)
 }
 
 func TestUncertainStartClosesSession(t *testing.T) {
@@ -235,23 +208,17 @@ func TestUncertainStartClosesSession(t *testing.T) {
 	defer cancel()
 	in := hp.TurnInput{Parts: []hp.InputPart{{Kind: hp.InputText, Text: "hello"}}}
 	_, err := s.StartTurn(ctx, in)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected timeout: %v", err)
-	}
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 	_, err = s.StartTurn(contextForTest(t), in)
-	if !errors.Is(err, hp.ErrClosed) {
-		t.Fatalf("uncertain session still accepts turns: %v", err)
-	}
+	require.ErrorIs(t, err, hp.ErrClosed)
 }
 
 func TestEnvironmentHome(t *testing.T) {
 	t.Setenv("CODEX_HOME", "/ambient")
-	if got := environment("", nil); !contains(got, "CODEX_HOME=/ambient") {
-		t.Fatal("ambient home was dropped")
-	}
-	if got := environment("/explicit", nil); !contains(got, "CODEX_HOME=/explicit") || contains(got, "CODEX_HOME=/ambient") {
-		t.Fatalf("explicit home was not authoritative: %v", got)
-	}
+	assert.Contains(t, environment("", nil), "CODEX_HOME=/ambient")
+	explicit := environment("/explicit", nil)
+	assert.Contains(t, explicit, "CODEX_HOME=/explicit")
+	assert.NotContains(t, explicit, "CODEX_HOME=/ambient")
 }
 
 func TestEarlyTerminalIsDeliveredBeforeEOF(t *testing.T) {
@@ -259,21 +226,18 @@ func TestEarlyTerminalIsDeliveredBeforeEOF(t *testing.T) {
 		s := openFake(t, "early_terminal")
 		turn := startFake(t, s)
 		e := next(t, turn)
-		if e.Kind != hp.EventTurnFinished || e.Outcome.Status != hp.OutcomeCompleted {
-			t.Fatalf("iteration %d: %+v", i, e)
-		}
-		if _, err := turn.Next(contextForTest(t)); err != io.EOF {
-			t.Fatalf("iteration %d: want EOF, got %v", i, err)
-		}
+		require.Equal(t, hp.EventTurnFinished, e.Kind, "iteration %d", i)
+		require.NotNil(t, e.Outcome, "iteration %d", i)
+		assert.Equal(t, hp.OutcomeCompleted, e.Outcome.Status, "iteration %d", i)
+		_, err := turn.Next(contextForTest(t))
+		require.ErrorIs(t, err, io.EOF, "iteration %d", i)
 		_ = s.Close()
 	}
 }
 func TestUnknownRequestGetsProtocolError(t *testing.T) {
 	s := openFake(t, "unknown_request")
 	turn := startFake(t, s)
-	if e := next(t, turn); e.Kind != hp.EventTurnFinished {
-		t.Fatalf("server request hung: %+v", e)
-	}
+	assert.Equal(t, hp.EventTurnFinished, next(t, turn).Kind)
 }
 func TestAgentMessageSnapshotFallback(t *testing.T) {
 	for _, scenario := range []string{"snapshot", "delta_snapshot"} {
@@ -291,19 +255,10 @@ func TestAgentMessageSnapshotFallback(t *testing.T) {
 					break
 				}
 			}
-			if count != 1 || text != "hello" {
-				t.Fatalf("text events=%d text=%q", count, text)
-			}
+			assert.Equal(t, 1, count)
+			assert.Equal(t, "hello", text)
 		})
 	}
-}
-func contains(v []string, w string) bool {
-	for _, x := range v {
-		if x == w {
-			return true
-		}
-	}
-	return false
 }
 
 type lockedBuffer struct {
@@ -333,31 +288,21 @@ func TestDebugLogsLifecycleWithoutContent(t *testing.T) {
 	p.config.Env = append(p.config.Env, "TEST_CREDENTIAL="+envSecret)
 	workspace := t.TempDir()
 	s, err := p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: workspace})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	turn, err := s.StartTurn(contextForTest(t), hp.TurnInput{Parts: []hp.InputPart{{Kind: hp.InputText, Text: secret}}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	for {
 		if e := next(t, turn); e.Kind == hp.EventTurnFinished {
 			break
 		}
 	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, s.Close())
 	got := logs.String()
 	for _, want := range []string{"codex app-server spawned", "codex initialized", "codex session opened", "codex turn admitted", "codex turn finished", "codex session closing", `"thread_id":"thread-1"`, `"turn_id":"turn-1"`} {
-		if !strings.Contains(got, want) {
-			t.Errorf("missing log %q", want)
-		}
+		assert.Contains(t, got, want)
 	}
 	for _, forbidden := range []string{secret, envSecret, workspace, "hello", "HARNESS_FAKE_PEER"} {
-		if strings.Contains(got, forbidden) {
-			t.Errorf("sensitive content in logs: %q", forbidden)
-		}
+		assert.NotContains(t, got, forbidden)
 	}
 }
 
@@ -366,12 +311,10 @@ func TestStderrDebugLogIsBoundedAndRedacted(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	drainStderr(strings.NewReader("error: SECRET_TOKEN_VALUE\n"+strings.Repeat("x", 5000)+"\n"), logger, []string{"ACCESS_TOKEN=SECRET_TOKEN_VALUE"})
 	got := logs.String()
-	if !strings.Contains(got, "error: [REDACTED]") || !strings.Contains(got, `"truncated":true`) {
-		t.Fatalf("missing sanitized stderr diagnostics: %s", got)
-	}
-	if strings.Contains(got, "SECRET_TOKEN_VALUE") || strings.Contains(got, strings.Repeat("x", 5000)) {
-		t.Fatal("stderr log leaked a credential or unbounded line")
-	}
+	assert.Contains(t, got, "error: [REDACTED]")
+	assert.Contains(t, got, `"truncated":true`)
+	assert.NotContains(t, got, "SECRET_TOKEN_VALUE")
+	assert.NotContains(t, got, strings.Repeat("x", 5000))
 }
 
 func TestDebugLogsFailedCommandOutcome(t *testing.T) {
@@ -381,27 +324,19 @@ func TestDebugLogsFailedCommandOutcome(t *testing.T) {
 	p.config.Logger = logger
 	p.config.Env = append(p.config.Env, "ACCESS_TOKEN=SECRET_TOKEN_VALUE")
 	s, err := p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	turn := startFake(t, s)
 	for {
 		if e := next(t, turn); e.Kind == hp.EventTurnFinished {
 			break
 		}
 	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, s.Close())
 	got := logs.String()
 	for _, want := range []string{`"item_type":"commandExecution"`, `"status":"failed"`, `"exit_code":1`, "permission denied: [REDACTED]"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("missing command diagnostic %q", want)
-		}
+		assert.Contains(t, got, want)
 	}
-	if strings.Contains(got, "SECRET_TOKEN_VALUE") {
-		t.Fatal("command diagnostic leaked a credential")
-	}
+	assert.NotContains(t, got, "SECRET_TOKEN_VALUE")
 }
 
 func TestDebugLogsApprovalAndInterrupt(t *testing.T) {
@@ -410,41 +345,26 @@ func TestDebugLogsApprovalAndInterrupt(t *testing.T) {
 	p := fakeProvider(t, "approval")
 	p.config.Logger = logger
 	s, err := p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	turn := startFake(t, s)
 	e := next(t, turn)
-	if e.Kind != hp.EventRequest {
-		t.Fatal(e)
-	}
-	if err := turn.Respond(contextForTest(t), e.Request.ID, hp.Response{OptionID: "decline"}); err != nil {
-		t.Fatal(err)
-	}
-	if e := next(t, turn); e.Kind != hp.EventTurnFinished {
-		t.Fatal(e)
-	}
+	require.Equal(t, hp.EventRequest, e.Kind)
+	require.NotNil(t, e.Request)
+	require.NoError(t, turn.Respond(contextForTest(t), e.Request.ID, hp.Response{OptionID: "decline"}))
+	assert.Equal(t, hp.EventTurnFinished, next(t, turn).Kind)
 	_ = s.Close()
 
 	p = fakeProvider(t, "pending")
 	p.config.Logger = logger
 	s, err = p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	turn = startFake(t, s)
-	if err := turn.Interrupt(contextForTest(t)); err != nil {
-		t.Fatal(err)
-	}
-	if e := next(t, turn); e.Kind != hp.EventTurnFinished {
-		t.Fatal(e)
-	}
+	require.NoError(t, turn.Interrupt(contextForTest(t)))
+	assert.Equal(t, hp.EventTurnFinished, next(t, turn).Kind)
 	_ = s.Close()
 
 	got := logs.String()
 	for _, want := range []string{"codex server request", "codex server request answered", "codex interrupt requested", "codex interrupt acknowledged"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("missing log %q", want)
-		}
+		assert.Contains(t, got, want)
 	}
 }
