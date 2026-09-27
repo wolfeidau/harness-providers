@@ -10,6 +10,7 @@ linters:
     - unused
     - gosec
     - gocritic
+    - gocyclo
     - goconst
     - usetesting
     - usestdlibvars
@@ -18,6 +19,10 @@ linters:
     - thelper
     - contextcheck
   settings:
+    gocyclo:
+      # Midpoint of the recommended 10-20 range:
+      # https://golangci-lint.run/docs/linters/configuration/#gocyclo
+      min-complexity: 15
     usetesting:
       context-background: true
       context-todo: true

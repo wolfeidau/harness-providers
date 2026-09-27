@@ -99,6 +99,19 @@ func (p *Provider) Open(ctx context.Context, in hp.OpenRequest) (hp.Session, err
 		_ = c.close()
 		return nil, err
 	}
+	threadID, err := s.openThread(ctx, cwd, requested)
+	if err != nil {
+		_ = c.close()
+		return nil, err
+	}
+	s.mu.Lock()
+	s.threadID = threadID
+	s.early = nil
+	s.mu.Unlock()
+	p.config.Logger.Debug("codex session opened", "thread_id", threadID, "resume", requested != "")
+	return s, nil
+}
+func (s *session) openThread(ctx context.Context, cwd, requested string) (string, error) {
 	method := "thread/start"
 	params := map[string]any{"cwd": cwd}
 	if requested != "" {
@@ -106,14 +119,13 @@ func (p *Provider) Open(ctx context.Context, in hp.OpenRequest) (hp.Session, err
 		params["threadId"] = requested
 		params["excludeTurns"] = true
 	}
-	raw, err := c.request(ctx, method, params)
+	raw, err := s.client.request(ctx, method, params)
 	if err != nil {
-		p.config.Logger.Warn("codex session open failed", "method", method, "error_kind", failureKind(err))
-		_ = c.close()
+		s.logger.Warn("codex session open failed", "method", method, "error_kind", failureKind(err))
 		if requested != "" && missingSession(err) {
-			return nil, fmt.Errorf("codex resume: %w", hp.ErrSessionNotFound)
+			return "", fmt.Errorf("codex resume: %w", hp.ErrSessionNotFound)
 		}
-		return nil, fmt.Errorf("codex %s: %w", method, err)
+		return "", fmt.Errorf("codex %s: %w", method, err)
 	}
 	var result struct {
 		Thread struct {
@@ -121,21 +133,14 @@ func (p *Provider) Open(ctx context.Context, in hp.OpenRequest) (hp.Session, err
 		} `json:"thread"`
 	}
 	if err = json.Unmarshal(raw, &result); err != nil || result.Thread.ID == "" {
-		p.config.Logger.Warn("codex invalid thread response", "method", method)
-		_ = c.close()
-		return nil, fmt.Errorf("codex %s: invalid thread response", method)
+		s.logger.Warn("codex invalid thread response", "method", method)
+		return "", fmt.Errorf("codex %s: invalid thread response", method)
 	}
 	if requested != "" && result.Thread.ID != requested {
-		p.config.Logger.Warn("codex resume identity changed")
-		_ = c.close()
-		return nil, fmt.Errorf("codex resume changed identity: %w", hp.ErrSessionNotFound)
+		s.logger.Warn("codex resume identity changed")
+		return "", fmt.Errorf("codex resume changed identity: %w", hp.ErrSessionNotFound)
 	}
-	s.mu.Lock()
-	s.threadID = result.Thread.ID
-	s.early = nil
-	s.mu.Unlock()
-	p.config.Logger.Debug("codex session opened", "thread_id", result.Thread.ID, "resume", requested != "")
-	return s, nil
+	return result.Thread.ID, nil
 }
 func missingSession(err error) bool {
 	msg := strings.ToLower(err.Error())
@@ -219,30 +224,7 @@ func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, erro
 	threadID := s.threadID
 	s.mu.Unlock()
 	s.logger.Debug("codex turn admission requested", "thread_id", threadID)
-	params := map[string]any{"threadId": threadID, "input": parts}
-	if in.Model != "" {
-		params["model"] = in.Model
-	}
-	if in.Effort != "" {
-		params["effort"] = in.Effort
-	}
-	if in.Policy.Approval != hp.ApprovalDefault {
-		if in.Policy.Approval == hp.ApprovalNever {
-			params["approvalPolicy"] = "never"
-		} else {
-			params["approvalPolicy"] = "on-request"
-		}
-	}
-	if in.Policy.Sandbox != hp.SandboxDefault {
-		switch in.Policy.Sandbox {
-		case hp.SandboxReadOnly:
-			params["sandboxPolicy"] = map[string]any{itemTypeField: "readOnly", "networkAccess": false}
-		case hp.SandboxWorkspaceWrite:
-			params["sandboxPolicy"] = map[string]any{itemTypeField: "workspaceWrite", "writableRoots": []string{}, "networkAccess": false, "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}
-		case hp.SandboxUnrestricted:
-			params["sandboxPolicy"] = map[string]any{itemTypeField: "dangerFullAccess"}
-		}
-	}
+	params := makeTurnParams(threadID, parts, in)
 	raw, err := s.client.request(ctx, "turn/start", params)
 	if err != nil {
 		if rejected, ok := errors.AsType[*rpcError](err); ok {
@@ -279,6 +261,33 @@ func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, erro
 	s.logger.Debug("codex turn admitted", "thread_id", threadID, "turn_id", t.id)
 	return t, nil
 }
+func makeTurnParams(threadID string, parts []map[string]any, in hp.TurnInput) map[string]any {
+	params := map[string]any{"threadId": threadID, "input": parts}
+	if in.Model != "" {
+		params["model"] = in.Model
+	}
+	if in.Effort != "" {
+		params["effort"] = in.Effort
+	}
+	if in.Policy.Approval != hp.ApprovalDefault {
+		if in.Policy.Approval == hp.ApprovalNever {
+			params["approvalPolicy"] = "never"
+		} else {
+			params["approvalPolicy"] = "on-request"
+		}
+	}
+	if in.Policy.Sandbox != hp.SandboxDefault {
+		switch in.Policy.Sandbox {
+		case hp.SandboxReadOnly:
+			params["sandboxPolicy"] = map[string]any{itemTypeField: "readOnly", "networkAccess": false}
+		case hp.SandboxWorkspaceWrite:
+			params["sandboxPolicy"] = map[string]any{itemTypeField: "workspaceWrite", "writableRoots": []string{}, "networkAccess": false, "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}
+		case hp.SandboxUnrestricted:
+			params["sandboxPolicy"] = map[string]any{itemTypeField: "dangerFullAccess"}
+		}
+	}
+	return params
+}
 func (s *session) receive(f frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -305,44 +314,47 @@ func (s *session) receive(f frame) {
 	}
 	s.dispatch(s.active, f)
 }
+
+type eventParams struct {
+	ThreadID   string `json:"threadId"`
+	TurnID     string `json:"turnId"`
+	ItemID     string `json:"itemId"`
+	Delta      string `json:"delta"`
+	TokenUsage struct {
+		Last struct {
+			InputTokens  int64 `json:"inputTokens"`
+			OutputTokens int64 `json:"outputTokens"`
+		} `json:"last"`
+	} `json:"tokenUsage"`
+	Item struct {
+		ID       string `json:"id"`
+		Type     string `json:"type"`
+		Status   string `json:"status"`
+		Command  string `json:"command"`
+		Text     string `json:"text"`
+		Output   string `json:"aggregatedOutput"`
+		ExitCode *int   `json:"exitCode"`
+	} `json:"item"`
+	Turn struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+		Error  struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	} `json:"turn"`
+	Questions []struct {
+		ID       string `json:"id"`
+		Header   string `json:"header"`
+		Question string `json:"question"`
+		Options  []struct {
+			Label       string `json:"label"`
+			Description string `json:"description"`
+		} `json:"options"`
+	} `json:"questions"`
+}
+
 func (s *session) dispatch(t *turn, f frame) {
-	var p struct {
-		ThreadID   string `json:"threadId"`
-		TurnID     string `json:"turnId"`
-		ItemID     string `json:"itemId"`
-		Delta      string `json:"delta"`
-		TokenUsage struct {
-			Last struct {
-				InputTokens  int64 `json:"inputTokens"`
-				OutputTokens int64 `json:"outputTokens"`
-			} `json:"last"`
-		} `json:"tokenUsage"`
-		Item struct {
-			ID       string `json:"id"`
-			Type     string `json:"type"`
-			Status   string `json:"status"`
-			Command  string `json:"command"`
-			Text     string `json:"text"`
-			Output   string `json:"aggregatedOutput"`
-			ExitCode *int   `json:"exitCode"`
-		} `json:"item"`
-		Turn struct {
-			ID     string `json:"id"`
-			Status string `json:"status"`
-			Error  struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		} `json:"turn"`
-		Questions []struct {
-			ID       string `json:"id"`
-			Header   string `json:"header"`
-			Question string `json:"question"`
-			Options  []struct {
-				Label       string `json:"label"`
-				Description string `json:"description"`
-			} `json:"options"`
-		} `json:"questions"`
-	}
+	var p eventParams
 	if json.Unmarshal(f.Params, &p) != nil || (p.ThreadID != "" && p.ThreadID != s.threadID) {
 		return
 	}
@@ -369,73 +381,81 @@ func (s *session) dispatch(t *turn, f frame) {
 		e.Kind = hp.EventUsage
 		e.Usage = &hp.Usage{InputTokens: p.TokenUsage.Last.InputTokens, OutputTokens: p.TokenUsage.Last.OutputTokens}
 	case "item/started", "item/updated", itemCompletedMethod:
-		if f.Method == itemCompletedMethod {
-			if p.Item.Type == "commandExecution" {
-				args := []any{"thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "item_type", p.Item.Type, "status", p.Item.Status}
-				if p.Item.ExitCode != nil {
-					args = append(args, "exit_code", *p.Item.ExitCode)
-				}
-				s.logger.Debug("codex item completed", args...)
-				if p.Item.Status == "failed" && p.Item.Output != "" {
-					output := p.Item.Output
-					if len(output) > 2048 {
-						output = output[:2048]
-					}
-					s.logger.Debug("codex command failed", "thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "output", redactStderr(output, s.client.cmd.Env))
-				}
-			} else {
-				s.logger.Debug("codex item completed", "thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "item_type", p.Item.Type, "status", p.Item.Status)
-			}
-		}
-		if f.Method == itemCompletedMethod && p.Item.Type == "agentMessage" && p.Item.Text != "" && !t.seenText[p.Item.ID] && !t.unattributedText {
-			s.enqueue(t, hp.Event{Kind: hp.EventTextDelta, TurnID: t.id, ItemID: p.Item.ID, Text: p.Item.Text})
-		}
-		e.ItemID = p.Item.ID
-		e.Item = &hp.Item{Kind: p.Item.Type, Label: p.Item.Command, Status: p.Item.Status}
-		switch f.Method {
-		case "item/started":
-			e.Kind = hp.EventItemStarted
-		case "item/updated":
-			e.Kind = hp.EventItemUpdated
-		case itemCompletedMethod:
-			e.Kind = hp.EventItemFinished
-		}
+		e = s.itemEvent(t, p, f.Method)
 	case "turn/completed":
-		e.Kind = hp.EventTurnFinished
-		e.Outcome = &hp.Outcome{Status: hp.OutcomeStatus(p.Turn.Status), Error: p.Turn.Error.Message}
-		if e.Outcome.Status != "completed" && e.Outcome.Status != "interrupted" && e.Outcome.Status != "failed" {
-			e.Outcome.Status = hp.OutcomeFailed
-		}
-		s.active = nil
-		s.logger.Debug("codex turn finished", "thread_id", s.threadID, "turn_id", t.id, "outcome", string(e.Outcome.Status))
+		e = s.turnFinishedEvent(t, p)
 	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", requestUserInputMethod:
 		if len(f.ID) == 0 {
 			return
 		}
-		e.Kind = hp.EventRequest
-		rid := string(f.ID)
-		kind := hp.RequestApproval
-		if f.Method == requestUserInputMethod {
-			kind = hp.RequestUserInput
-		}
-		r := &hp.Request{ID: rid, Kind: kind, Title: f.Method, Options: []hp.Option{{ID: "accept", Label: "Accept"}, {ID: "decline", Label: "Decline"}, {ID: "cancel", Label: "Cancel"}}}
-		if kind == hp.RequestUserInput {
-			r.Options = nil
-			for _, q := range p.Questions {
-				question := hp.Question{ID: q.ID, Prompt: q.Question, AllowFreeText: true}
-				for _, o := range q.Options {
-					question.Options = append(question.Options, hp.Option{ID: o.Label, Label: o.Label})
-				}
-				r.Questions = append(r.Questions, question)
-			}
-		}
-		e.Request = r
-		t.pending[rid] = pendingRequest{id: f.ID, method: f.Method}
-		s.logger.Debug("codex server request", "thread_id", s.threadID, "turn_id", t.id, "request_id", rid, "method", f.Method)
+		e = s.requestEvent(t, p, f)
 	default:
 		return
 	}
 	s.enqueue(t, e)
+}
+func (s *session) itemEvent(t *turn, p eventParams, method string) hp.Event {
+	if method == itemCompletedMethod {
+		s.logCompletedItem(t, p)
+		if p.Item.Type == "agentMessage" && p.Item.Text != "" && !t.seenText[p.Item.ID] && !t.unattributedText {
+			s.enqueue(t, hp.Event{Kind: hp.EventTextDelta, TurnID: t.id, ItemID: p.Item.ID, Text: p.Item.Text})
+		}
+	}
+	e := hp.Event{TurnID: t.id, ItemID: p.Item.ID, Item: &hp.Item{Kind: p.Item.Type, Label: p.Item.Command, Status: p.Item.Status}}
+	switch method {
+	case "item/started":
+		e.Kind = hp.EventItemStarted
+	case "item/updated":
+		e.Kind = hp.EventItemUpdated
+	case itemCompletedMethod:
+		e.Kind = hp.EventItemFinished
+	}
+	return e
+}
+func (s *session) logCompletedItem(t *turn, p eventParams) {
+	args := []any{"thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "item_type", p.Item.Type, "status", p.Item.Status}
+	if p.Item.Type == "commandExecution" && p.Item.ExitCode != nil {
+		args = append(args, "exit_code", *p.Item.ExitCode)
+	}
+	s.logger.Debug("codex item completed", args...)
+	if p.Item.Type != "commandExecution" || p.Item.Status != "failed" || p.Item.Output == "" {
+		return
+	}
+	output := p.Item.Output
+	if len(output) > 2048 {
+		output = output[:2048]
+	}
+	s.logger.Debug("codex command failed", "thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "output", redactStderr(output, s.client.cmd.Env))
+}
+func (s *session) turnFinishedEvent(t *turn, p eventParams) hp.Event {
+	e := hp.Event{Kind: hp.EventTurnFinished, TurnID: t.id, Outcome: &hp.Outcome{Status: hp.OutcomeStatus(p.Turn.Status), Error: p.Turn.Error.Message}}
+	if e.Outcome.Status != "completed" && e.Outcome.Status != "interrupted" && e.Outcome.Status != "failed" {
+		e.Outcome.Status = hp.OutcomeFailed
+	}
+	s.active = nil
+	s.logger.Debug("codex turn finished", "thread_id", s.threadID, "turn_id", t.id, "outcome", string(e.Outcome.Status))
+	return e
+}
+func (s *session) requestEvent(t *turn, p eventParams, f frame) hp.Event {
+	rid := string(f.ID)
+	kind := hp.RequestApproval
+	if f.Method == requestUserInputMethod {
+		kind = hp.RequestUserInput
+	}
+	r := &hp.Request{ID: rid, Kind: kind, Title: f.Method, Options: []hp.Option{{ID: "accept", Label: "Accept"}, {ID: "decline", Label: "Decline"}, {ID: "cancel", Label: "Cancel"}}}
+	if kind == hp.RequestUserInput {
+		r.Options = nil
+		for _, q := range p.Questions {
+			question := hp.Question{ID: q.ID, Prompt: q.Question, AllowFreeText: true}
+			for _, o := range q.Options {
+				question.Options = append(question.Options, hp.Option{ID: o.Label, Label: o.Label})
+			}
+			r.Questions = append(r.Questions, question)
+		}
+	}
+	t.pending[rid] = pendingRequest{id: f.ID, method: f.Method}
+	s.logger.Debug("codex server request", "thread_id", s.threadID, "turn_id", t.id, "request_id", rid, "method", f.Method)
+	return hp.Event{Kind: hp.EventRequest, TurnID: t.id, Request: r}
 }
 func (s *session) enqueue(t *turn, e hp.Event) {
 	select {

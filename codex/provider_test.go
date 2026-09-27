@@ -32,18 +32,7 @@ func TestFakePeer(t *testing.T) {
 		if json.Unmarshal(s.Bytes(), &f) != nil {
 			os.Exit(2)
 		}
-		write := func(v any) {
-			b, err := json.Marshal(v)
-			if err != nil {
-				os.Exit(2)
-			}
-			if _, err := fmt.Fprintln(w, string(b)); err != nil {
-				os.Exit(2)
-			}
-			if err := w.Flush(); err != nil {
-				os.Exit(2)
-			}
-		}
+		write := func(v any) { writeFakeFrame(w, v) }
 		switch f.Method {
 		case "initialize":
 			write(map[string]any{"id": f.ID, "result": map[string]any{}})
@@ -56,40 +45,7 @@ func TestFakePeer(t *testing.T) {
 				write(map[string]any{"id": f.ID, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}})
 			}
 		case "turn/start":
-			if scenario == "timeout" {
-				continue
-			}
-			if scenario == "early_terminal" {
-				write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
-			}
-			if scenario == "early" {
-				write(map[string]any{"method": "turn/started", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1"}}})
-			}
-			write(map[string]any{"id": f.ID, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}})
-			if scenario == "exit" {
-				os.Exit(3)
-			}
-			if scenario == "approval" {
-				write(map[string]any{"id": 77, "method": "item/commandExecution/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1"}})
-			}
-			if scenario == "unknown_request" {
-				write(map[string]any{"id": 78, "method": "item/unknown/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1"}})
-			}
-			if scenario == "snapshot" || scenario == "delta_snapshot" {
-				if scenario == "delta_snapshot" {
-					write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "message-1", "delta": "hello"}})
-				}
-				write(map[string]any{"method": "item/completed", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "item": map[string]any{"id": "message-1", "type": "agentMessage", "text": "hello"}}})
-				write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
-			}
-			if scenario == "command_failure" {
-				write(map[string]any{"method": "item/completed", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "item": map[string]any{"id": "command-1", "type": "commandExecution", "status": "failed", "command": "cat access.go", "exitCode": 1, "aggregatedOutput": "permission denied: SECRET_TOKEN_VALUE"}}})
-				write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
-			}
-			if scenario == "normal" || scenario == "early" {
-				write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "delta": "hello"}})
-				write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
-			}
+			fakeTurnStart(write, f, scenario)
 		case "turn/interrupt":
 			write(map[string]any{"id": f.ID, "result": map[string]any{}})
 			write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "interrupted"}}})
@@ -103,6 +59,56 @@ func TestFakePeer(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func writeFakeFrame(w *bufio.Writer, v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		os.Exit(2)
+	}
+	if _, err := fmt.Fprintln(w, string(b)); err != nil {
+		os.Exit(2)
+	}
+	if err := w.Flush(); err != nil {
+		os.Exit(2)
+	}
+}
+
+func fakeTurnStart(write func(any), f frame, scenario string) {
+	if scenario == "timeout" {
+		return
+	}
+	if scenario == "early_terminal" {
+		write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
+	}
+	if scenario == "early" {
+		write(map[string]any{"method": "turn/started", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1"}}})
+	}
+	write(map[string]any{"id": f.ID, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}})
+	if scenario == "exit" {
+		os.Exit(3)
+	}
+	if scenario == "approval" {
+		write(map[string]any{"id": 77, "method": "item/commandExecution/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1"}})
+	}
+	if scenario == "unknown_request" {
+		write(map[string]any{"id": 78, "method": "item/unknown/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1"}})
+	}
+	if scenario == "snapshot" || scenario == "delta_snapshot" {
+		if scenario == "delta_snapshot" {
+			write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "message-1", "delta": "hello"}})
+		}
+		write(map[string]any{"method": "item/completed", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "item": map[string]any{"id": "message-1", "type": "agentMessage", "text": "hello"}}})
+		write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
+	}
+	if scenario == "command_failure" {
+		write(map[string]any{"method": "item/completed", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "item": map[string]any{"id": "command-1", "type": "commandExecution", "status": "failed", "command": "cat access.go", "exitCode": 1, "aggregatedOutput": "permission denied: SECRET_TOKEN_VALUE"}}})
+		write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
+	}
+	if scenario == "normal" || scenario == "early" {
+		write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "delta": "hello"}})
+		write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
+	}
 }
 
 func fakeProvider(t *testing.T, scenario string) *Provider {

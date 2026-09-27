@@ -185,31 +185,9 @@ func (c *client) read(r io.Reader) {
 			c.fail(fmt.Errorf("decode app-server frame: %w", err))
 			return
 		}
-		if len(f.ID) > 0 && f.Method == "" {
-			id := string(f.ID)
-			c.mu.Lock()
-			ch := c.waiting[id]
-			delete(c.waiting, id)
-			c.mu.Unlock()
-			if ch != nil {
-				if f.Error != nil {
-					c.logger.Debug("codex response", "request_id", id, "outcome", "rpc_error", "rpc_code", f.Error.Code)
-					ch <- reply{err: f.Error}
-				} else {
-					c.logger.Debug("codex response", "request_id", id, "outcome", "success")
-					ch <- reply{result: f.Result}
-				}
-			}
-		} else if f.Method != "" {
-			if len(f.ID) > 0 && f.Method != "item/commandExecution/requestApproval" && f.Method != "item/fileChange/requestApproval" && f.Method != requestUserInputMethod {
-				c.logger.Warn("codex unsupported server request", "method", f.Method)
-				if err := c.reject(f.ID, "unsupported server request: "+f.Method); err != nil {
-					c.fail(err)
-					return
-				}
-				continue
-			}
-			c.onMessage(f)
+		if err := c.handleFrame(f); err != nil {
+			c.fail(err)
+			return
 		}
 	}
 	c.mu.Lock()
@@ -225,6 +203,46 @@ func (c *client) read(r io.Reader) {
 			c.logger.Warn("codex app-server stream ended")
 		}
 		c.fail(fmt.Errorf("codex app-server stream ended unexpectedly: %w", io.ErrUnexpectedEOF))
+	}
+}
+func (c *client) handleFrame(f frame) error {
+	if len(f.ID) > 0 && f.Method == "" {
+		c.handleResponse(f)
+		return nil
+	}
+	if f.Method == "" {
+		return nil
+	}
+	if len(f.ID) > 0 && !supportedServerRequest(f.Method) {
+		c.logger.Warn("codex unsupported server request", "method", f.Method)
+		return c.reject(f.ID, "unsupported server request: "+f.Method)
+	}
+	c.onMessage(f)
+	return nil
+}
+func (c *client) handleResponse(f frame) {
+	id := string(f.ID)
+	c.mu.Lock()
+	ch := c.waiting[id]
+	delete(c.waiting, id)
+	c.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	if f.Error != nil {
+		c.logger.Debug("codex response", "request_id", id, "outcome", "rpc_error", "rpc_code", f.Error.Code)
+		ch <- reply{err: f.Error}
+		return
+	}
+	c.logger.Debug("codex response", "request_id", id, "outcome", "success")
+	ch <- reply{result: f.Result}
+}
+func supportedServerRequest(method string) bool {
+	switch method {
+	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", requestUserInputMethod:
+		return true
+	default:
+		return false
 	}
 }
 func (c *client) write(v any) error {

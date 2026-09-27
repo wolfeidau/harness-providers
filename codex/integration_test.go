@@ -146,7 +146,7 @@ func checkLiveModel(t *testing.T, home, model, effort string) error {
 
 func readLiveTurn(t *testing.T, turn hp.Turn) (string, error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 75*time.Second)
 	defer cancel()
 	var out strings.Builder
 	for {
