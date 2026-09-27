@@ -1,0 +1,8 @@
+[settings]
+experimental = true
+lockfile = true
+
+[tools]
+go = "1.27.1"
+golangci-lint = "v2.13.1"
+goreleaser = "v2.17.1"
