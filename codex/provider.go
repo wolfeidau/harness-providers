@@ -245,8 +245,7 @@ func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, erro
 	}
 	raw, err := s.client.request(ctx, "turn/start", params)
 	if err != nil {
-		var rejected *rpcError
-		if errors.As(err, &rejected) {
+		if rejected, ok := errors.AsType[*rpcError](err); ok {
 			s.logger.Debug("codex turn admission rejected", "thread_id", threadID, "rpc_code", rejected.Code)
 			s.mu.Lock()
 			if s.active == t {
