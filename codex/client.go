@@ -79,11 +79,16 @@ func newClient(binary string, args, env []string, dir string, logger *slog.Logge
 	}
 	logger.Debug("codex app-server spawned", "pid", cmd.Process.Pid)
 	c := &client{cmd: cmd, logger: logger, stdin: stdin, waiting: make(map[string]chan reply), onMessage: onMessage, done: make(chan struct{}), waitDone: make(chan struct{})}
-	go func() { _, _ = io.Copy(io.Discard, stderr) }()
+	stderrDone := make(chan struct{})
+	go func() {
+		drainStderr(stderr, logger, env)
+		close(stderrDone)
+	}()
 	readDone := make(chan struct{})
 	go func() { c.read(stdout); close(readDone) }()
 	go func() {
 		<-readDone
+		<-stderrDone
 		err := cmd.Wait()
 		c.mu.Lock()
 		closing := c.closing
@@ -100,6 +105,59 @@ func newClient(binary string, args, env []string, dir string, logger *slog.Logge
 		close(c.waitDone)
 	}()
 	return c, nil
+}
+
+func drainStderr(r io.Reader, logger *slog.Logger, env []string) {
+	const maxLines = 100
+	const maxLineBytes = 4096
+	reader := bufio.NewReader(r)
+	lines := 0
+	for {
+		var line []byte
+		truncated := false
+		for {
+			part, prefix, err := reader.ReadLine()
+			if err != nil {
+				if err != io.EOF {
+					logger.Debug("codex app-server stderr read failed", "error_kind", failureKind(err))
+				}
+				return
+			}
+			if lines < maxLines {
+				remaining := maxLineBytes - len(line)
+				if len(part) > remaining {
+					line = append(line, part[:remaining]...)
+					truncated = true
+				} else {
+					line = append(line, part...)
+				}
+			}
+			if !prefix {
+				break
+			}
+		}
+		if lines == maxLines {
+			logger.Debug("codex app-server stderr limit reached", "lines", maxLines)
+		}
+		if lines < maxLines {
+			logger.Debug("codex app-server stderr", "line", redactStderr(string(line), env), "truncated", truncated)
+		}
+		lines++
+	}
+}
+
+func redactStderr(line string, env []string) string {
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || len(value) < 4 {
+			continue
+		}
+		key = strings.ToUpper(key)
+		if strings.Contains(key, "TOKEN") || strings.Contains(key, "KEY") || strings.Contains(key, "SECRET") || strings.Contains(key, "PASSWORD") {
+			line = strings.ReplaceAll(line, value, "[REDACTED]")
+		}
+	}
+	return line
 }
 func (c *client) fail(err error) {
 	c.mu.Lock()

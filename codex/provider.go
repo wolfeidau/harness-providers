@@ -319,11 +319,13 @@ func (s *session) dispatch(t *turn, f frame) {
 			} `json:"last"`
 		} `json:"tokenUsage"`
 		Item struct {
-			ID      string `json:"id"`
-			Type    string `json:"type"`
-			Status  string `json:"status"`
-			Command string `json:"command"`
-			Text    string `json:"text"`
+			ID       string `json:"id"`
+			Type     string `json:"type"`
+			Status   string `json:"status"`
+			Command  string `json:"command"`
+			Text     string `json:"text"`
+			Output   string `json:"aggregatedOutput"`
+			ExitCode *int   `json:"exitCode"`
 		} `json:"item"`
 		Turn struct {
 			ID     string `json:"id"`
@@ -368,6 +370,24 @@ func (s *session) dispatch(t *turn, f frame) {
 		e.Kind = hp.EventUsage
 		e.Usage = &hp.Usage{InputTokens: p.TokenUsage.Last.InputTokens, OutputTokens: p.TokenUsage.Last.OutputTokens}
 	case "item/started", "item/updated", itemCompletedMethod:
+		if f.Method == itemCompletedMethod {
+			if p.Item.Type == "commandExecution" {
+				args := []any{"thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "item_type", p.Item.Type, "status", p.Item.Status}
+				if p.Item.ExitCode != nil {
+					args = append(args, "exit_code", *p.Item.ExitCode)
+				}
+				s.logger.Debug("codex item completed", args...)
+				if p.Item.Status == "failed" && p.Item.Output != "" {
+					output := p.Item.Output
+					if len(output) > 2048 {
+						output = output[:2048]
+					}
+					s.logger.Debug("codex command failed", "thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "output", redactStderr(output, s.client.cmd.Env))
+				}
+			} else {
+				s.logger.Debug("codex item completed", "thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "item_type", p.Item.Type, "status", p.Item.Status)
+			}
+		}
 		if f.Method == itemCompletedMethod && p.Item.Type == "agentMessage" && p.Item.Text != "" && !t.seenText[p.Item.ID] && !t.unattributedText {
 			s.enqueue(t, hp.Event{Kind: hp.EventTextDelta, TurnID: t.id, ItemID: p.Item.ID, Text: p.Item.Text})
 		}

@@ -81,6 +81,10 @@ func TestFakePeer(t *testing.T) {
 				write(map[string]any{"method": "item/completed", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "item": map[string]any{"id": "message-1", "type": "agentMessage", "text": "hello"}}})
 				write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
 			}
+			if scenario == "command_failure" {
+				write(map[string]any{"method": "item/completed", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "item": map[string]any{"id": "command-1", "type": "commandExecution", "status": "failed", "command": "cat access.go", "exitCode": 1, "aggregatedOutput": "permission denied: SECRET_TOKEN_VALUE"}}})
+				write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
+			}
 			if scenario == "normal" || scenario == "early" {
 				write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "delta": "hello"}})
 				write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
@@ -354,6 +358,49 @@ func TestDebugLogsLifecycleWithoutContent(t *testing.T) {
 		if strings.Contains(got, forbidden) {
 			t.Errorf("sensitive content in logs: %q", forbidden)
 		}
+	}
+}
+
+func TestStderrDebugLogIsBoundedAndRedacted(t *testing.T) {
+	var logs lockedBuffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	drainStderr(strings.NewReader("error: SECRET_TOKEN_VALUE\n"+strings.Repeat("x", 5000)+"\n"), logger, []string{"ACCESS_TOKEN=SECRET_TOKEN_VALUE"})
+	got := logs.String()
+	if !strings.Contains(got, "error: [REDACTED]") || !strings.Contains(got, `"truncated":true`) {
+		t.Fatalf("missing sanitized stderr diagnostics: %s", got)
+	}
+	if strings.Contains(got, "SECRET_TOKEN_VALUE") || strings.Contains(got, strings.Repeat("x", 5000)) {
+		t.Fatal("stderr log leaked a credential or unbounded line")
+	}
+}
+
+func TestDebugLogsFailedCommandOutcome(t *testing.T) {
+	var logs lockedBuffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	p := fakeProvider(t, "command_failure")
+	p.config.Logger = logger
+	p.config.Env = append(p.config.Env, "ACCESS_TOKEN=SECRET_TOKEN_VALUE")
+	s, err := p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := startFake(t, s)
+	for {
+		if e := next(t, turn); e.Kind == hp.EventTurnFinished {
+			break
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := logs.String()
+	for _, want := range []string{`"item_type":"commandExecution"`, `"status":"failed"`, `"exit_code":1`, "permission denied: [REDACTED]"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing command diagnostic %q", want)
+		}
+	}
+	if strings.Contains(got, "SECRET_TOKEN_VALUE") {
+		t.Fatal("command diagnostic leaked a credential")
 	}
 }
 
