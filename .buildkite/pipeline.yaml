@@ -1,0 +1,18 @@
+steps:
+  - label: ":golangci-lint: Lint"
+    key: lint
+    timeout_in_minutes: 20
+    plugins:
+      - mise#v1.1.5:
+          install_args: go golangci-lint
+    command: golangci-lint run
+
+  - label: ":golang: Test"
+    key: test
+    timeout_in_minutes: 20
+    plugins:
+      - mise#v1.1.5:
+          install_args: go
+    command: bash .buildkite/test.sh
+    artifact_paths:
+      - ".buildkite/results/*"
