@@ -4,7 +4,7 @@
 
 ## Requirements
 
-- Go 1.26.5 or newer (the version in `go.mod`).
+- Go 1.27.1 or newer (the version in `go.mod` and `mise.toml`).
 - A `codex` CLI on `PATH`, or its path in `codex.Config.Binary`.
 - Codex authentication available to the child process.
 - An existing workspace directory.
