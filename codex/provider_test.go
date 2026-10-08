@@ -374,3 +374,15 @@ func TestDebugLogsApprovalAndInterrupt(t *testing.T) {
 		assert.Contains(t, got, want)
 	}
 }
+
+func TestItemStatusNormalization(t *testing.T) {
+	for raw, want := range map[string]hp.ItemStatus{
+		"inProgress": hp.ItemRunning,
+		"completed":  hp.ItemCompleted,
+		"failed":     hp.ItemFailed,
+		"declined":   hp.ItemDeclined,
+		"queued":     hp.ItemStatus("queued"),
+	} {
+		assert.Equal(t, want, itemStatus(raw), raw)
+	}
+}

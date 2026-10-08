@@ -22,12 +22,18 @@ type Config struct {
 	Env    []string
 	Logger *slog.Logger
 }
+
 type Provider struct{ config Config }
 
 const (
 	providerName        = "codex"
 	itemTypeField       = "type"
 	itemCompletedMethod = "item/completed"
+	clientVersion       = "0.1.0"
+	cursorVersion       = 1
+	eventBufferSize     = 256
+	earlyBufferSize     = 256
+	outputLimit         = 2048
 )
 
 func New(config Config) *Provider {
@@ -39,6 +45,7 @@ func New(config Config) *Provider {
 	}
 	return &Provider{config: config}
 }
+
 func (*Provider) Name() string { return providerName }
 
 type cursorData struct {
@@ -46,7 +53,7 @@ type cursorData struct {
 }
 
 func decodeCursor(c *hp.Cursor) (string, error) {
-	if c.Provider != providerName || c.Version != 1 {
+	if c.Provider != providerName || c.Version != cursorVersion {
 		return "", hp.ErrInvalidCursor
 	}
 	var d cursorData
@@ -68,12 +75,15 @@ type session struct {
 
 func (p *Provider) Open(ctx context.Context, in hp.OpenRequest) (hp.Session, error) {
 	info, err := os.Stat(in.WorkingDirectory)
-	if err != nil || !info.IsDir() {
-		return nil, fmt.Errorf("codex open workspace: %w", os.ErrNotExist)
+	if err != nil {
+		return nil, fmt.Errorf("codex open workspace: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("codex open workspace %q: not a directory: %w", in.WorkingDirectory, os.ErrNotExist)
 	}
 	cwd, err := filepath.Abs(in.WorkingDirectory)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("codex resolve workspace: %w", err)
 	}
 	var requested string
 	if in.Resume != nil {
@@ -82,22 +92,21 @@ func (p *Provider) Open(ctx context.Context, in hp.OpenRequest) (hp.Session, err
 			return nil, err
 		}
 	}
-	p.config.Logger.Debug("codex session opening", "resume", requested != "")
+	p.config.Logger.DebugContext(ctx, "codex session opening", "resume", requested != "")
 	s := &session{logger: p.config.Logger}
 	c, err := newClient(p.config.Binary, p.config.Args, environment(p.config.Home, p.config.Env), cwd, p.config.Logger, s.receive)
 	if err != nil {
 		return nil, fmt.Errorf("codex start: %w", err)
 	}
 	s.client = c
-	if _, err = c.request(ctx, "initialize", map[string]any{"clientInfo": map[string]any{"name": "harness-providers", "version": "0.1.0"}, "capabilities": map[string]any{"experimentalApi": true}}); err != nil {
-		p.config.Logger.Warn("codex initialize failed", "error_kind", failureKind(err))
+	if _, err = c.request(ctx, "initialize", map[string]any{"clientInfo": map[string]any{"name": "harness-providers", "version": clientVersion}, "capabilities": map[string]any{"experimentalApi": true}}); err != nil {
 		_ = c.close()
 		return nil, fmt.Errorf("codex initialize: %w", err)
 	}
-	p.config.Logger.Debug("codex initialized")
+	p.config.Logger.DebugContext(ctx, "codex initialized")
 	if err = c.notify("initialized", map[string]any{}); err != nil {
 		_ = c.close()
-		return nil, err
+		return nil, fmt.Errorf("codex initialized notification: %w", err)
 	}
 	threadID, err := s.openThread(ctx, cwd, requested)
 	if err != nil {
@@ -106,11 +115,11 @@ func (p *Provider) Open(ctx context.Context, in hp.OpenRequest) (hp.Session, err
 	}
 	s.mu.Lock()
 	s.threadID = threadID
-	s.early = nil
 	s.mu.Unlock()
-	p.config.Logger.Debug("codex session opened", "thread_id", threadID, "resume", requested != "")
+	p.config.Logger.DebugContext(ctx, "codex session opened", "thread_id", threadID, "resume", requested != "")
 	return s, nil
 }
+
 func (s *session) openThread(ctx context.Context, cwd, requested string) (string, error) {
 	method := "thread/start"
 	params := map[string]any{"cwd": cwd}
@@ -121,7 +130,6 @@ func (s *session) openThread(ctx context.Context, cwd, requested string) (string
 	}
 	raw, err := s.client.request(ctx, method, params)
 	if err != nil {
-		s.logger.Warn("codex session open failed", "method", method, "error_kind", failureKind(err))
 		if requested != "" && missingSession(err) {
 			return "", fmt.Errorf("codex resume: %w", hp.ErrSessionNotFound)
 		}
@@ -133,25 +141,26 @@ func (s *session) openThread(ctx context.Context, cwd, requested string) (string
 		} `json:"thread"`
 	}
 	if err = json.Unmarshal(raw, &result); err != nil || result.Thread.ID == "" {
-		s.logger.Warn("codex invalid thread response", "method", method)
 		return "", fmt.Errorf("codex %s: invalid thread response", method)
 	}
 	if requested != "" && result.Thread.ID != requested {
-		s.logger.Warn("codex resume identity changed")
 		return "", fmt.Errorf("codex resume changed identity: %w", hp.ErrSessionNotFound)
 	}
 	return result.Thread.ID, nil
 }
+
 func missingSession(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "thread") && (strings.Contains(msg, "not found") || strings.Contains(msg, "does not exist") || strings.Contains(msg, "no such"))
 }
+
 func (s *session) Cursor() hp.Cursor {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b, _ := json.Marshal(cursorData{ThreadID: s.threadID})
-	return hp.Cursor{Provider: providerName, Version: 1, Data: b}
+	return hp.Cursor{Provider: providerName, Version: cursorVersion, Data: b}
 }
+
 func (s *session) Close() error {
 	s.mu.Lock()
 	s.closed = true
@@ -160,6 +169,7 @@ func (s *session) Close() error {
 	s.logger.Debug("codex session closing", "thread_id", threadID)
 	return s.client.close()
 }
+
 func validateInput(in hp.TurnInput) ([]map[string]any, error) {
 	if len(in.Parts) == 0 {
 		return nil, hp.ErrUnsupported
@@ -177,7 +187,7 @@ func validateInput(in hp.TurnInput) ([]map[string]any, error) {
 				return nil, hp.ErrUnsupported
 			}
 			if _, err := os.Stat(p.Path); err != nil {
-				return nil, err
+				return nil, fmt.Errorf("codex local image: %w", err)
 			}
 			parts = append(parts, map[string]any{itemTypeField: "localImage", "path": p.Path})
 		default:
@@ -187,14 +197,14 @@ func validateInput(in hp.TurnInput) ([]map[string]any, error) {
 	if len(parts) == 0 {
 		return nil, hp.ErrUnsupported
 	}
-	if in.Effort != "" {
-		switch in.Effort {
-		case "none", "minimal", "low", "medium", "high", "xhigh":
-		default:
-			return nil, hp.ErrUnsupported
-		}
+	switch in.Effort {
+	case "", "none", "minimal", "low", "medium", "high", "xhigh":
+	default:
+		return nil, hp.ErrUnsupported
 	}
-	if in.Policy.Approval != hp.ApprovalDefault && in.Policy.Approval != hp.ApprovalOnRequest && in.Policy.Approval != hp.ApprovalNever {
+	switch in.Policy.Approval {
+	case hp.ApprovalDefault, hp.ApprovalOnRequest, hp.ApprovalNever:
+	default:
 		return nil, hp.ErrUnsupported
 	}
 	switch in.Policy.Sandbox {
@@ -204,6 +214,7 @@ func validateInput(in hp.TurnInput) ([]map[string]any, error) {
 	}
 	return parts, nil
 }
+
 func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, error) {
 	parts, err := validateInput(in)
 	if err != nil {
@@ -218,17 +229,17 @@ func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, erro
 		s.mu.Unlock()
 		return nil, hp.ErrBusy
 	}
-	t := &turn{s: s, events: make(chan hp.Event, 256), pending: make(map[string]pendingRequest), seenText: make(map[string]bool)}
+	t := &turn{s: s, events: make(chan hp.Event, eventBufferSize), pending: make(map[string]pendingRequest), seenText: make(map[string]bool)}
 	s.active = t
 	s.early = nil
 	threadID := s.threadID
 	s.mu.Unlock()
-	s.logger.Debug("codex turn admission requested", "thread_id", threadID)
+	s.logger.DebugContext(ctx, "codex turn admission requested", "thread_id", threadID)
 	params := makeTurnParams(threadID, parts, in)
 	raw, err := s.client.request(ctx, "turn/start", params)
 	if err != nil {
 		if rejected, ok := errors.AsType[*rpcError](err); ok {
-			s.logger.Debug("codex turn admission rejected", "thread_id", threadID, "rpc_code", rejected.Code)
+			s.logger.DebugContext(ctx, "codex turn admission rejected", "thread_id", threadID, "rpc_code", rejected.Code)
 			s.mu.Lock()
 			if s.active == t {
 				s.active = nil
@@ -236,7 +247,6 @@ func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, erro
 			s.mu.Unlock()
 			return nil, fmt.Errorf("codex turn/start rejected: %w", err)
 		}
-		s.logger.Warn("codex turn admission uncertain", "thread_id", threadID, "error_kind", failureKind(err))
 		_ = s.Close()
 		return nil, fmt.Errorf("codex turn/start (acceptance uncertain; session closed): %w", err)
 	}
@@ -246,7 +256,6 @@ func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, erro
 		} `json:"turn"`
 	}
 	if err = json.Unmarshal(raw, &result); err != nil || result.Turn.ID == "" {
-		s.logger.Warn("codex invalid turn response", "thread_id", threadID)
 		_ = s.Close()
 		return nil, fmt.Errorf("codex turn/start: invalid turn response; session closed")
 	}
@@ -258,9 +267,10 @@ func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, erro
 		s.dispatch(t, f)
 	}
 	s.mu.Unlock()
-	s.logger.Debug("codex turn admitted", "thread_id", threadID, "turn_id", t.id)
+	s.logger.DebugContext(ctx, "codex turn admitted", "thread_id", threadID, "turn_id", t.id)
 	return t, nil
 }
+
 func makeTurnParams(threadID string, parts []map[string]any, in hp.TurnInput) map[string]any {
 	params := map[string]any{"threadId": threadID, "input": parts}
 	if in.Model != "" {
@@ -269,42 +279,34 @@ func makeTurnParams(threadID string, parts []map[string]any, in hp.TurnInput) ma
 	if in.Effort != "" {
 		params["effort"] = in.Effort
 	}
-	if in.Policy.Approval != hp.ApprovalDefault {
-		if in.Policy.Approval == hp.ApprovalNever {
-			params["approvalPolicy"] = "never"
-		} else {
-			params["approvalPolicy"] = "on-request"
-		}
+	switch in.Policy.Approval {
+	case hp.ApprovalNever:
+		params["approvalPolicy"] = "never"
+	case hp.ApprovalOnRequest:
+		params["approvalPolicy"] = "on-request"
 	}
-	if in.Policy.Sandbox != hp.SandboxDefault {
-		switch in.Policy.Sandbox {
-		case hp.SandboxReadOnly:
-			params["sandboxPolicy"] = map[string]any{itemTypeField: "readOnly", "networkAccess": false}
-		case hp.SandboxWorkspaceWrite:
-			params["sandboxPolicy"] = map[string]any{itemTypeField: "workspaceWrite", "writableRoots": []string{}, "networkAccess": false, "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}
-		case hp.SandboxUnrestricted:
-			params["sandboxPolicy"] = map[string]any{itemTypeField: "dangerFullAccess"}
-		}
+	switch in.Policy.Sandbox {
+	case hp.SandboxReadOnly:
+		params["sandboxPolicy"] = map[string]any{itemTypeField: "readOnly", "networkAccess": false}
+	case hp.SandboxWorkspaceWrite:
+		params["sandboxPolicy"] = map[string]any{itemTypeField: "workspaceWrite", "writableRoots": []string{}, "networkAccess": false, "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}
+	case hp.SandboxUnrestricted:
+		params["sandboxPolicy"] = map[string]any{itemTypeField: "dangerFullAccess"}
 	}
 	return params
 }
+
 func (s *session) receive(f frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.threadID == "" {
-		if len(f.ID) > 0 {
-			_ = s.client.reject(f.ID, "no active Codex turn")
-		}
-		return
-	}
-	if s.active == nil {
+	if s.closed || s.threadID == "" || s.active == nil {
 		if len(f.ID) > 0 {
 			_ = s.client.reject(f.ID, "no active Codex turn")
 		}
 		return
 	}
 	if s.active.id == "" {
-		if len(s.early) < 256 {
+		if len(s.early) < earlyBufferSize {
 			s.early = append(s.early, f)
 		} else {
 			s.logger.Warn("codex early event buffer full", "thread_id", s.threadID)
@@ -353,6 +355,7 @@ type eventParams struct {
 	} `json:"questions"`
 }
 
+// Callers must hold s.mu.
 func (s *session) dispatch(t *turn, f frame) {
 	var p eventParams
 	if json.Unmarshal(f.Params, &p) != nil || (p.ThreadID != "" && p.ThreadID != s.threadID) {
@@ -394,6 +397,7 @@ func (s *session) dispatch(t *turn, f frame) {
 	}
 	s.enqueue(t, e)
 }
+
 func (s *session) itemEvent(t *turn, p eventParams, method string) hp.Event {
 	if method == itemCompletedMethod {
 		s.logCompletedItem(t, p)
@@ -401,7 +405,7 @@ func (s *session) itemEvent(t *turn, p eventParams, method string) hp.Event {
 			s.enqueue(t, hp.Event{Kind: hp.EventTextDelta, TurnID: t.id, ItemID: p.Item.ID, Text: p.Item.Text})
 		}
 	}
-	e := hp.Event{TurnID: t.id, ItemID: p.Item.ID, Item: &hp.Item{Kind: p.Item.Type, Label: p.Item.Command, Status: hp.ItemStatus(p.Item.Status)}}
+	e := hp.Event{TurnID: t.id, ItemID: p.Item.ID, Item: &hp.Item{Kind: p.Item.Type, Label: p.Item.Command, Status: itemStatus(p.Item.Status)}}
 	switch method {
 	case "item/started":
 		e.Kind = hp.EventItemStarted
@@ -412,6 +416,22 @@ func (s *session) itemEvent(t *turn, p eventParams, method string) hp.Event {
 	}
 	return e
 }
+
+func itemStatus(raw string) hp.ItemStatus {
+	switch raw {
+	case "inProgress":
+		return hp.ItemRunning
+	case "completed":
+		return hp.ItemCompleted
+	case "failed":
+		return hp.ItemFailed
+	case "declined":
+		return hp.ItemDeclined
+	default:
+		return hp.ItemStatus(raw)
+	}
+}
+
 func (s *session) logCompletedItem(t *turn, p eventParams) {
 	args := []any{"thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "item_type", p.Item.Type, "status", p.Item.Status}
 	if p.Item.Type == "commandExecution" && p.Item.ExitCode != nil {
@@ -422,20 +442,24 @@ func (s *session) logCompletedItem(t *turn, p eventParams) {
 		return
 	}
 	output := p.Item.Output
-	if len(output) > 2048 {
-		output = output[:2048]
+	if len(output) > outputLimit {
+		output = output[:outputLimit]
 	}
 	s.logger.Debug("codex command failed", "thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "output", redactStderr(output, s.client.cmd.Env))
 }
+
 func (s *session) turnFinishedEvent(t *turn, p eventParams) hp.Event {
 	e := hp.Event{Kind: hp.EventTurnFinished, TurnID: t.id, Outcome: &hp.Outcome{Status: hp.OutcomeStatus(p.Turn.Status), Error: p.Turn.Error.Message}}
-	if e.Outcome.Status != "completed" && e.Outcome.Status != "interrupted" && e.Outcome.Status != "failed" {
+	switch e.Outcome.Status {
+	case hp.OutcomeCompleted, hp.OutcomeInterrupted, hp.OutcomeFailed:
+	default:
 		e.Outcome.Status = hp.OutcomeFailed
 	}
 	s.active = nil
 	s.logger.Debug("codex turn finished", "thread_id", s.threadID, "turn_id", t.id, "outcome", string(e.Outcome.Status))
 	return e
 }
+
 func (s *session) requestEvent(t *turn, p eventParams, f frame) hp.Event {
 	rid := string(f.ID)
 	kind := hp.RequestApproval
@@ -457,6 +481,7 @@ func (s *session) requestEvent(t *turn, p eventParams, f frame) hp.Event {
 	s.logger.Debug("codex server request", "thread_id", s.threadID, "turn_id", t.id, "request_id", rid, "method", f.Method)
 	return hp.Event{Kind: hp.EventRequest, TurnID: t.id, Request: r}
 }
+
 func (s *session) enqueue(t *turn, e hp.Event) {
 	select {
 	case t.events <- e:
@@ -470,6 +495,7 @@ type pendingRequest struct {
 	id     json.RawMessage
 	method string
 }
+
 type turn struct {
 	s                *session
 	id               string
@@ -481,50 +507,63 @@ type turn struct {
 }
 
 func (t *turn) ID() string { return t.id }
+
 func (t *turn) Next(ctx context.Context) (hp.Event, error) {
 	if t.readDone {
 		return hp.Event{}, io.EOF
 	}
 	select {
 	case e := <-t.events:
-		if e.Kind == hp.EventTurnFinished {
-			t.readDone = true
-		}
-		return e, nil
+		return t.delivered(e)
 	default:
 	}
 	select {
 	case e := <-t.events:
-		if e.Kind == hp.EventTurnFinished {
-			t.readDone = true
-		}
-		return e, nil
+		return t.delivered(e)
 	case <-ctx.Done():
 		return hp.Event{}, ctx.Err()
 	case <-t.s.client.done:
 		select {
 		case e := <-t.events:
-			if e.Kind == hp.EventTurnFinished {
-				t.readDone = true
-			}
-			return e, nil
+			return t.delivered(e)
 		default:
 		}
 		return hp.Event{}, t.s.client.failure()
 	}
 }
+
+func (t *turn) delivered(e hp.Event) (hp.Event, error) {
+	if e.Kind == hp.EventTurnFinished {
+		t.readDone = true
+	}
+	return e, nil
+}
+
 func (t *turn) Respond(ctx context.Context, id string, response hp.Response) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	p, result, err := t.takePending(id, response)
+	if err != nil {
+		return err
+	}
+	if err := t.s.client.respond(p.id, result); err != nil {
+		return fmt.Errorf("codex respond to request %s: %w", id, err)
+	}
+	t.s.logger.DebugContext(ctx, "codex server request answered", "thread_id", t.s.threadID, "turn_id", t.id, "request_id", id, "method", p.method)
+	return nil
+}
+
+// takePending leaves the request pending when the response is unsupported.
+func (t *turn) takePending(id string, response hp.Response) (pendingRequest, any, error) {
 	t.s.mu.Lock()
+	defer t.s.mu.Unlock()
 	p, ok := t.pending[id]
-	t.s.mu.Unlock()
 	if !ok {
-		return hp.ErrRequestNotFound
+		return pendingRequest{}, nil, hp.ErrRequestNotFound
 	}
 	var result any
-	if p.method == "item/tool/requestUserInput" {
+	if p.method == requestUserInputMethod {
 		answers := map[string]any{}
 		for k, v := range response.Answers {
 			if len(v) > 0 {
@@ -534,42 +573,29 @@ func (t *turn) Respond(ctx context.Context, id string, response hp.Response) err
 		result = map[string]any{"answers": answers}
 	} else {
 		switch response.OptionID {
-		case "accept", "acceptForSession", "decline", "cancel":
+		case "accept", "decline", "cancel":
 		default:
-			return hp.ErrUnsupported
+			return pendingRequest{}, nil, hp.ErrUnsupported
 		}
 		result = map[string]any{"decision": response.OptionID}
 	}
-	t.s.mu.Lock()
-	if _, exists := t.pending[id]; !exists {
-		t.s.mu.Unlock()
-		return hp.ErrRequestNotFound
-	}
 	delete(t.pending, id)
-	t.s.mu.Unlock()
-	err := t.s.client.respond(p.id, result)
-	if err != nil {
-		t.s.logger.Warn("codex server request response failed", "thread_id", t.s.threadID, "turn_id", t.id, "request_id", id)
-	} else {
-		t.s.logger.Debug("codex server request answered", "thread_id", t.s.threadID, "turn_id", t.id, "request_id", id, "method", p.method)
-	}
-	return err
+	return p, result, nil
 }
+
 func (t *turn) Interrupt(ctx context.Context) error {
 	t.s.mu.Lock()
 	active := t.s.active == t
 	threadID := t.s.threadID
 	t.s.mu.Unlock()
 	if !active {
-		t.s.logger.Debug("codex interrupt skipped", "turn_id", t.id, "reason", "inactive")
+		t.s.logger.DebugContext(ctx, "codex interrupt skipped", "turn_id", t.id, "reason", "inactive")
 		return nil
 	}
-	t.s.logger.Debug("codex interrupt requested", "thread_id", threadID, "turn_id", t.id)
-	_, err := t.s.client.request(ctx, "turn/interrupt", map[string]any{"threadId": threadID, "turnId": t.id})
-	if err != nil {
-		t.s.logger.Warn("codex interrupt failed", "thread_id", threadID, "turn_id", t.id, "error_kind", failureKind(err))
-	} else {
-		t.s.logger.Debug("codex interrupt acknowledged", "thread_id", threadID, "turn_id", t.id)
+	t.s.logger.DebugContext(ctx, "codex interrupt requested", "thread_id", threadID, "turn_id", t.id)
+	if _, err := t.s.client.request(ctx, "turn/interrupt", map[string]any{"threadId": threadID, "turnId": t.id}); err != nil {
+		return fmt.Errorf("codex turn/interrupt: %w", err)
 	}
-	return err
+	t.s.logger.DebugContext(ctx, "codex interrupt acknowledged", "thread_id", threadID, "turn_id", t.id)
+	return nil
 }
