@@ -401,7 +401,7 @@ func (s *session) itemEvent(t *turn, p eventParams, method string) hp.Event {
 			s.enqueue(t, hp.Event{Kind: hp.EventTextDelta, TurnID: t.id, ItemID: p.Item.ID, Text: p.Item.Text})
 		}
 	}
-	e := hp.Event{TurnID: t.id, ItemID: p.Item.ID, Item: &hp.Item{Kind: p.Item.Type, Label: p.Item.Command, Status: p.Item.Status}}
+	e := hp.Event{TurnID: t.id, ItemID: p.Item.ID, Item: &hp.Item{Kind: p.Item.Type, Label: p.Item.Command, Status: hp.ItemStatus(p.Item.Status)}}
 	switch method {
 	case "item/started":
 		e.Kind = hp.EventItemStarted

@@ -137,8 +137,16 @@ type Event struct {
 type Item struct {
 	Kind   string // e.g. command, file_change, tool_call, reasoning
 	Label  string
-	Status string // running, completed, failed, declined
+	Status ItemStatus
 }
+type ItemStatus string
+
+const (
+	ItemRunning   ItemStatus = "running"
+	ItemCompleted ItemStatus = "completed"
+	ItemFailed    ItemStatus = "failed"
+	ItemDeclined  ItemStatus = "declined"
+)
 type Usage struct {
 	InputTokens  int64
 	OutputTokens int64
