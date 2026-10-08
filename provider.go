@@ -17,33 +17,40 @@ var (
 
 type Provider interface {
 	Name() string
-	Open(context.Context, OpenRequest) (Session, error)
+	Open(ctx context.Context, in OpenRequest) (Session, error)
 }
+
 type OpenRequest struct {
 	WorkingDirectory string
-	Resume           *Cursor
+	Resume           *Cursor // nil creates a new native conversation
 }
+
+// Cursor is durable, opaque provider-owned resume data. It contains no secrets.
 type Cursor struct {
 	Provider string          `json:"provider"`
 	Version  int             `json:"version"`
 	Data     json.RawMessage `json:"data"`
 }
+
 type Session interface {
 	Cursor() Cursor
-	StartTurn(context.Context, TurnInput) (Turn, error)
+	StartTurn(ctx context.Context, in TurnInput) (Turn, error)
 	Close() error
 }
+
 type TurnInput struct {
 	Parts  []InputPart
-	Model  string
-	Effort string
+	Model  string // empty uses the provider default
+	Effort string // empty uses the provider default; unsupported values fail
 	Policy ExecutionPolicy
 }
+
 type InputPart struct {
 	Kind InputKind
 	Text string
-	Path string
+	Path string // absolute path for local_image
 }
+
 type InputKind string
 
 const (
@@ -51,10 +58,12 @@ const (
 	InputLocalImage InputKind = "local_image"
 )
 
+// Zero values mean provider defaults; adapters must reject unsupported non-zero settings rather than weaken them.
 type ExecutionPolicy struct {
 	Approval ApprovalMode
 	Sandbox  SandboxMode
 }
+
 type ApprovalMode string
 
 const (
@@ -72,12 +81,14 @@ const (
 	SandboxUnrestricted   SandboxMode = "unrestricted"
 )
 
+// Next yields one terminal event, then io.EOF; transport failures return an error.
 type Turn interface {
 	ID() string
-	Next(context.Context) (Event, error)
-	Respond(context.Context, string, Response) error
-	Interrupt(context.Context) error
+	Next(ctx context.Context) (Event, error)
+	Respond(ctx context.Context, requestID string, response Response) error
+	Interrupt(ctx context.Context) error
 }
+
 type EventKind string
 
 const (
@@ -91,6 +102,7 @@ const (
 	EventTurnFinished EventKind = "turn_finished"
 )
 
+// Fields are populated per Kind; consumers must tolerate unknown kinds.
 type Event struct {
 	Kind    EventKind
 	TurnID  string
@@ -101,12 +113,32 @@ type Event struct {
 	Usage   *Usage
 	Outcome *Outcome
 }
-type Item struct{ Kind, Label, Status string }
-type Usage struct{ InputTokens, OutputTokens int64 }
+
+type Item struct {
+	Kind   string // descriptive only (e.g. command, file_change); must not drive authorization
+	Label  string
+	Status ItemStatus
+}
+
+type ItemStatus string
+
+const (
+	ItemRunning   ItemStatus = "running"
+	ItemCompleted ItemStatus = "completed"
+	ItemFailed    ItemStatus = "failed"
+	ItemDeclined  ItemStatus = "declined"
+)
+
+type Usage struct {
+	InputTokens  int64
+	OutputTokens int64
+}
+
 type Outcome struct {
 	Status OutcomeStatus
-	Error  string
+	Error  string // human-readable detail when failed
 }
+
 type OutcomeStatus string
 
 const (
@@ -123,6 +155,7 @@ type Request struct {
 	Options     []Option
 	Questions   []Question
 }
+
 type RequestKind string
 
 const (
@@ -130,7 +163,11 @@ const (
 	RequestUserInput RequestKind = "user_input"
 )
 
-type Option struct{ ID, Label string }
+type Option struct {
+	ID    string
+	Label string
+}
+
 type Question struct {
 	ID            string
 	Prompt        string
@@ -138,7 +175,8 @@ type Question struct {
 	AllowFreeText bool
 	Multiple      bool
 }
+
 type Response struct {
-	OptionID string
-	Answers  map[string][]string
+	OptionID string              // approval choice, if applicable
+	Answers  map[string][]string // question ID -> answers
 }
