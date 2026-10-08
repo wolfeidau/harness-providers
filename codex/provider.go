@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	hp "github.com/wolfeidau/harness-providers"
 )
@@ -79,7 +80,7 @@ func (p *Provider) Open(ctx context.Context, in hp.OpenRequest) (hp.Session, err
 		return nil, fmt.Errorf("codex open workspace: %w", err)
 	}
 	if !info.IsDir() {
-		return nil, fmt.Errorf("codex open workspace %q: not a directory: %w", in.WorkingDirectory, os.ErrNotExist)
+		return nil, fmt.Errorf("codex open workspace %q: %w", in.WorkingDirectory, syscall.ENOTDIR)
 	}
 	cwd, err := filepath.Abs(in.WorkingDirectory)
 	if err != nil {
@@ -149,6 +150,7 @@ func (s *session) openThread(ctx context.Context, cwd, requested string) (string
 	return result.Thread.ID, nil
 }
 
+// Codex exposes no stable error code for missing threads, so match on the message.
 func missingSession(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "thread") && (strings.Contains(msg, "not found") || strings.Contains(msg, "does not exist") || strings.Contains(msg, "no such"))
@@ -427,6 +429,8 @@ func itemStatus(raw string) hp.ItemStatus {
 		return hp.ItemFailed
 	case "declined":
 		return hp.ItemDeclined
+	case "interrupted":
+		return hp.ItemInterrupted
 	default:
 		return hp.ItemStatus(raw)
 	}
