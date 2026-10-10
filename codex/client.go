@@ -21,9 +21,11 @@ type rpcError struct {
 }
 
 const (
-	jsonRPCField           = "jsonrpc"
-	jsonRPCVersion         = "2.0"
-	requestUserInputMethod = "item/tool/requestUserInput"
+	jsonRPCField             = "jsonrpc"
+	jsonRPCVersion           = "2.0"
+	requestUserInputMethod   = "item/tool/requestUserInput"
+	commandApprovalMethod    = "item/commandExecution/requestApproval"
+	fileChangeApprovalMethod = "item/fileChange/requestApproval"
 )
 
 func (e *rpcError) Error() string { return fmt.Sprintf("rpc %d: %s", e.Code, e.Message) }
@@ -239,7 +241,7 @@ func (c *client) handleResponse(f frame) {
 }
 func supportedServerRequest(method string) bool {
 	switch method {
-	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", requestUserInputMethod:
+	case commandApprovalMethod, fileChangeApprovalMethod, requestUserInputMethod:
 		return true
 	default:
 		return false

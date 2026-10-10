@@ -149,13 +149,32 @@ const (
 )
 
 type Request struct {
-	ID          string
-	Kind        RequestKind
-	Title       string
-	Description string
-	Options     []Option
-	Questions   []Question
+	ID        string
+	Kind      RequestKind
+	ItemID    string    // the item this request concerns, if any
+	Approval  *Approval // set when Kind is RequestApproval
+	Options   []Option
+	Questions []Question
 }
+
+type Approval struct {
+	Action    ActionKind
+	Command   string // exact command to run; never redacted or truncated so the approver sees what executes
+	Cwd       string
+	Paths     []string // files the change touches, when known
+	WriteRoot string   // broader write access requested, if any
+	Reason    string
+	Host      string // network host requested, if any
+	Protocol  string // network protocol requested, if any
+}
+
+type ActionKind string
+
+const (
+	ActionCommand    ActionKind = "command"
+	ActionFileChange ActionKind = "file_change"
+	ActionWriteStdin ActionKind = "write_stdin"
+)
 
 type RequestKind string
 
@@ -165,12 +184,14 @@ const (
 )
 
 type Option struct {
-	ID    string
-	Label string
+	ID          string
+	Label       string
+	Description string
 }
 
 type Question struct {
 	ID            string
+	Header        string
 	Prompt        string
 	Options       []Option
 	AllowFreeText bool
