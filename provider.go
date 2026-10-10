@@ -164,6 +164,8 @@ type Approval struct {
 	Paths     []string // files the change touches, when known
 	WriteRoot string   // broader write access requested, if any
 	Reason    string
+	Host      string // network host requested, if any
+	Protocol  string // network protocol requested, if any
 }
 
 type ActionKind string
@@ -171,6 +173,7 @@ type ActionKind string
 const (
 	ActionCommand    ActionKind = "command"
 	ActionFileChange ActionKind = "file_change"
+	ActionWriteStdin ActionKind = "write_stdin"
 )
 
 type RequestKind string

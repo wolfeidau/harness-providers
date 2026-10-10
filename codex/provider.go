@@ -320,12 +320,17 @@ func (s *session) receive(f frame) {
 }
 
 type eventParams struct {
-	ThreadID   string `json:"threadId"`
-	TurnID     string `json:"turnId"`
-	ItemID     string `json:"itemId"`
-	Cwd        string `json:"cwd"`
-	Command    string `json:"command"`
-	Reason     string `json:"reason"`
+	ThreadID string `json:"threadId"`
+	TurnID   string `json:"turnId"`
+	ItemID   string `json:"itemId"`
+	Cwd      string `json:"cwd"`
+	Command  string `json:"command"`
+	Reason   string `json:"reason"`
+	Kind     string `json:"kind"`
+	Network  *struct {
+		Host     string `json:"host"`
+		Protocol string `json:"protocol"`
+	} `json:"networkApprovalContext"`
 	GrantRoot  string `json:"grantRoot"`
 	Delta      string `json:"delta"`
 	TokenUsage struct {
@@ -397,10 +402,10 @@ func (s *session) dispatch(t *turn, f frame) {
 	case "turn/completed":
 		e = s.turnFinishedEvent(t, p)
 	case commandApprovalMethod, fileChangeApprovalMethod, requestUserInputMethod:
-		if len(f.ID) == 0 {
+		var ok bool
+		if e, ok = s.requestEvent(t, p, f); !ok {
 			return
 		}
-		e = s.requestEvent(t, p, f)
 	default:
 		return
 	}
@@ -408,7 +413,8 @@ func (s *session) dispatch(t *turn, f frame) {
 }
 
 func (s *session) itemEvent(t *turn, p eventParams, method string) hp.Event {
-	if p.Item.Type == "fileChange" && method != itemCompletedMethod {
+	// Updates may omit changes; keep the paths already known.
+	if p.Item.Type == "fileChange" && method != itemCompletedMethod && len(p.Item.Changes) > 0 {
 		t.filePaths[p.Item.ID] = changePaths(p)
 	}
 	if method == itemCompletedMethod {
@@ -482,7 +488,16 @@ func (s *session) turnFinishedEvent(t *turn, p eventParams) hp.Event {
 	return e
 }
 
-func (s *session) requestEvent(t *turn, p eventParams, f frame) hp.Event {
+func (s *session) requestEvent(t *turn, p eventParams, f frame) (hp.Event, bool) {
+	if len(f.ID) == 0 {
+		return hp.Event{}, false
+	}
+	action, ok := commandAction(p.Kind)
+	if !ok && f.Method == commandApprovalMethod {
+		s.logger.Warn("codex unsupported approval kind", "kind", p.Kind)
+		_ = s.client.reject(f.ID, "unsupported approval kind: "+p.Kind)
+		return hp.Event{}, false
+	}
 	rid := string(f.ID)
 	kind := hp.RequestApproval
 	if f.Method == requestUserInputMethod {
@@ -491,7 +506,10 @@ func (s *session) requestEvent(t *turn, p eventParams, f frame) hp.Event {
 	r := &hp.Request{ID: rid, Kind: kind, ItemID: p.ItemID, Options: []hp.Option{{ID: "accept", Label: "Accept"}, {ID: "decline", Label: "Decline"}, {ID: "cancel", Label: "Cancel"}}}
 	switch f.Method {
 	case commandApprovalMethod:
-		r.Approval = &hp.Approval{Action: hp.ActionCommand, Command: p.Command, Cwd: p.Cwd, Reason: p.Reason}
+		r.Approval = &hp.Approval{Action: action, Command: p.Command, Cwd: p.Cwd, Reason: p.Reason}
+		if p.Network != nil {
+			r.Approval.Host, r.Approval.Protocol = p.Network.Host, p.Network.Protocol
+		}
 	case fileChangeApprovalMethod:
 		r.Approval = &hp.Approval{Action: hp.ActionFileChange, Paths: t.filePaths[p.ItemID], WriteRoot: p.GrantRoot, Reason: p.Reason}
 	}
@@ -507,7 +525,17 @@ func (s *session) requestEvent(t *turn, p eventParams, f frame) hp.Event {
 	}
 	t.pending[rid] = pendingRequest{id: f.ID, method: f.Method}
 	s.logger.Debug("codex server request", "thread_id", s.threadID, "turn_id", t.id, "request_id", rid, "method", f.Method)
-	return hp.Event{Kind: hp.EventRequest, TurnID: t.id, Request: r}
+	return hp.Event{Kind: hp.EventRequest, TurnID: t.id, Request: r}, true
+}
+
+func commandAction(kind string) (hp.ActionKind, bool) {
+	switch kind {
+	case "", "command":
+		return hp.ActionCommand, true
+	case "writeStdin":
+		return hp.ActionWriteStdin, true
+	}
+	return "", false
 }
 
 func (s *session) enqueue(t *turn, e hp.Event) {

@@ -22,7 +22,8 @@ import (
 	hp "github.com/wolfeidau/harness-providers"
 )
 
-func TestCodexReviewE2E(t *testing.T) {
+func liveProvider(t *testing.T) *Provider {
+	t.Helper()
 	if os.Getenv("HARNESS_LIVE_TEST") != "1" {
 		t.Skip("set HARNESS_LIVE_TEST=1 to make model calls")
 	}
@@ -35,14 +36,18 @@ func TestCodexReviewE2E(t *testing.T) {
 		require.NoError(t, os.Mkdir(home, 0700))
 	}
 	require.NoError(t, checkLiveModel(t, home, "gpt-6-luna", "low"))
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return New(Config{Home: home, Logger: logger})
+}
+
+func TestCodexReviewE2E(t *testing.T) {
+	p := liveProvider(t)
 	workspace := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(workspace, "access.go"), []byte("package access\n\nfunc CanDelete(actor, owner string) bool {\n return actor != owner\n}\n"), 0600))
 	markerBytes := make([]byte, 8)
-	_, err = rand.Read(markerBytes)
+	_, err := rand.Read(markerBytes)
 	require.NoError(t, err)
 	marker := hex.EncodeToString(markerBytes)
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	p := New(Config{Home: home, Logger: logger})
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 	defer cancel()
 	s, err := p.Open(ctx, hp.OpenRequest{WorkingDirectory: workspace})
@@ -87,6 +92,53 @@ func TestCodexReviewE2E(t *testing.T) {
 	answer, err := readLiveTurn(t, turn2)
 	require.NoError(t, err)
 	require.Contains(t, answer, marker, "resume lost previous message marker")
+}
+
+func TestCodexApprovalE2E(t *testing.T) {
+	p := liveProvider(t)
+	workspace := t.TempDir()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	defer cancel()
+	s, err := p.Open(ctx, hp.OpenRequest{WorkingDirectory: workspace})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close Codex session: %v", err)
+		}
+	})
+	prompt := "Use the shell command tool to run exactly `touch approved.txt` in the current directory. The sandbox is read-only, so the command will be blocked: request escalated permission (sandbox_permissions require_escalated) with a short justification so the user can approve it. Do not use any other method to create the file."
+	turn, err := s.StartTurn(ctx, hp.TurnInput{Parts: []hp.InputPart{{Kind: hp.InputText, Text: prompt}}, Model: "gpt-6-luna", Effort: "low", Policy: hp.ExecutionPolicy{Approval: hp.ApprovalOnRequest, Sandbox: hp.SandboxReadOnly}})
+	require.NoError(t, err)
+	var finished *hp.Outcome
+	declined := false
+	for finished == nil {
+		e, err := turn.Next(ctx)
+		require.NoError(t, err)
+		switch {
+		case e.Kind == hp.EventRequest && e.Request.Kind == hp.RequestApproval:
+			require.False(t, declined, "unexpected second approval request: %+v", e.Request.Approval)
+			require.NotEmpty(t, e.Request.ItemID)
+			a := e.Request.Approval
+			require.NotNil(t, a)
+			t.Logf("approval: %+v", *a)
+			require.Contains(t, []hp.ActionKind{hp.ActionCommand, hp.ActionFileChange}, a.Action)
+			if a.Action == hp.ActionCommand {
+				require.NotEmpty(t, a.Command)
+				require.NotEmpty(t, a.Cwd)
+			}
+			require.NoError(t, turn.Respond(ctx, e.Request.ID, hp.Response{OptionID: "decline"}))
+			declined = true
+		case e.Kind == hp.EventRequest:
+			stopLiveTurn(turn)
+			t.Fatalf("unexpected request kind: %s", e.Request.Kind)
+		case e.Kind == hp.EventTurnFinished:
+			finished = e.Outcome
+		}
+	}
+	require.True(t, declined, "turn finished without an approval request: %+v", finished)
+	require.NotNil(t, finished)
+	_, err = os.Stat(filepath.Join(workspace, "approved.txt"))
+	require.ErrorIs(t, err, os.ErrNotExist, "declined command created the file")
 }
 
 func checkLiveModel(t *testing.T, home, model, effort string) error {

@@ -96,8 +96,11 @@ func fakeTurnStart(write func(any), f frame, scenario string) {
 	if scenario == "structured" {
 		write(map[string]any{"id": 80, "method": "item/commandExecution/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "cmd-1", "command": "rm -rf build", "cwd": "/work", "reason": "cleanup"}})
 		write(map[string]any{"method": "item/started", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "item": map[string]any{"id": "patch-1", "type": "fileChange", "status": "inProgress", "changes": []any{map[string]any{"path": "/work/a.go", "kind": "update", "diff": ""}, map[string]any{"path": "/work/b.go", "kind": "add", "diff": ""}}}}})
+		write(map[string]any{"method": "item/updated", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "item": map[string]any{"id": "patch-1", "type": "fileChange", "status": "inProgress", "changes": []any{}}}})
 		write(map[string]any{"id": 81, "method": "item/fileChange/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "patch-1", "grantRoot": "/work", "reason": "needs write"}})
 		write(map[string]any{"id": 82, "method": "item/tool/requestUserInput", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "tool-1", "questions": []any{map[string]any{"id": "q1", "header": "Pick", "question": "Which?", "options": []any{map[string]any{"label": "A", "description": "first"}}}}}})
+		write(map[string]any{"id": 83, "method": "item/commandExecution/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "cmd-2", "kind": "writeStdin", "networkApprovalContext": map[string]any{"host": "example.com", "protocol": "https"}}})
+		write(map[string]any{"id": 84, "method": "item/commandExecution/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "cmd-3", "kind": "future"}})
 	}
 	if scenario == "unknown_request" {
 		write(map[string]any{"id": 78, "method": "item/unknown/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1"}})
@@ -205,13 +208,15 @@ func TestApprovalAndInterrupt(t *testing.T) {
 }
 func TestStructuredRequests(t *testing.T) {
 	turn := startFake(t, openFake(t, "structured"))
-	var cmd, patch, input *hp.Request
-	for cmd == nil || patch == nil || input == nil {
+	var cmd, stdin, patch, input *hp.Request
+	for cmd == nil || stdin == nil || patch == nil || input == nil {
 		e := next(t, turn)
 		switch {
 		case e.Kind != hp.EventRequest:
 		case e.Request.Approval != nil && e.Request.Approval.Action == hp.ActionCommand:
 			cmd = e.Request
+		case e.Request.Approval != nil && e.Request.Approval.Action == hp.ActionWriteStdin:
+			stdin = e.Request
 		case e.Request.Approval != nil:
 			patch = e.Request
 		default:
@@ -220,11 +225,16 @@ func TestStructuredRequests(t *testing.T) {
 	}
 	assert.Equal(t, "cmd-1", cmd.ItemID)
 	assert.Equal(t, &hp.Approval{Action: hp.ActionCommand, Command: "rm -rf build", Cwd: "/work", Reason: "cleanup"}, cmd.Approval)
+	assert.Equal(t, &hp.Approval{Action: hp.ActionWriteStdin, Host: "example.com", Protocol: "https"}, stdin.Approval)
 	assert.Equal(t, "patch-1", patch.ItemID)
 	assert.Equal(t, &hp.Approval{Action: hp.ActionFileChange, Paths: []string{"/work/a.go", "/work/b.go"}, WriteRoot: "/work", Reason: "needs write"}, patch.Approval)
 	require.Len(t, input.Questions, 1)
 	assert.Equal(t, "Pick", input.Questions[0].Header)
 	assert.Equal(t, "first", input.Questions[0].Options[0].Description)
+	// The unknown approval kind is rejected, which makes the fake peer end the turn.
+	for e := next(t, turn); e.Kind != hp.EventTurnFinished; e = next(t, turn) {
+		assert.NotEqual(t, hp.EventRequest, e.Kind)
+	}
 }
 func TestExitAndResumeErrors(t *testing.T) {
 	s := openFake(t, "exit")
