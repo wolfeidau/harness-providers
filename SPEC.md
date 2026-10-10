@@ -142,10 +142,11 @@ type Item struct {
 type ItemStatus string
 
 const (
-	ItemRunning   ItemStatus = "running"
-	ItemCompleted ItemStatus = "completed"
-	ItemFailed    ItemStatus = "failed"
-	ItemDeclined  ItemStatus = "declined"
+	ItemRunning     ItemStatus = "running"
+	ItemCompleted   ItemStatus = "completed"
+	ItemFailed      ItemStatus = "failed"
+	ItemDeclined    ItemStatus = "declined"
+	ItemInterrupted ItemStatus = "interrupted"
 )
 type Usage struct {
 	InputTokens  int64

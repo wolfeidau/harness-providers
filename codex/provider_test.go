@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -373,4 +375,25 @@ func TestDebugLogsApprovalAndInterrupt(t *testing.T) {
 	for _, want := range []string{"codex server request", "codex server request answered", "codex interrupt requested", "codex interrupt acknowledged"} {
 		assert.Contains(t, got, want)
 	}
+}
+
+func TestItemStatusNormalization(t *testing.T) {
+	for raw, want := range map[string]hp.ItemStatus{
+		"inProgress":  hp.ItemRunning,
+		"completed":   hp.ItemCompleted,
+		"failed":      hp.ItemFailed,
+		"declined":    hp.ItemDeclined,
+		"interrupted": hp.ItemInterrupted,
+		"queued":      hp.ItemStatus("queued"),
+	} {
+		assert.Equal(t, want, itemStatus(raw), raw)
+	}
+}
+
+func TestOpenRejectsFileWorkspace(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	require.NoError(t, os.WriteFile(file, nil, 0o600))
+	_, err := New(Config{}).Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: file})
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, syscall.ENOTDIR))
 }
