@@ -231,7 +231,7 @@ func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, erro
 		s.mu.Unlock()
 		return nil, hp.ErrBusy
 	}
-	t := &turn{s: s, events: make(chan hp.Event, eventBufferSize), pending: make(map[string]pendingRequest), seenText: make(map[string]bool)}
+	t := &turn{s: s, events: make(chan hp.Event, eventBufferSize), pending: make(map[string]pendingRequest), seenText: make(map[string]bool), filePaths: make(map[string][]string)}
 	s.active = t
 	s.early = nil
 	threadID := s.threadID
@@ -323,6 +323,10 @@ type eventParams struct {
 	ThreadID   string `json:"threadId"`
 	TurnID     string `json:"turnId"`
 	ItemID     string `json:"itemId"`
+	Cwd        string `json:"cwd"`
+	Command    string `json:"command"`
+	Reason     string `json:"reason"`
+	GrantRoot  string `json:"grantRoot"`
 	Delta      string `json:"delta"`
 	TokenUsage struct {
 		Last struct {
@@ -338,6 +342,9 @@ type eventParams struct {
 		Text     string `json:"text"`
 		Output   string `json:"aggregatedOutput"`
 		ExitCode *int   `json:"exitCode"`
+		Changes  []struct {
+			Path string `json:"path"`
+		} `json:"changes"`
 	} `json:"item"`
 	Turn struct {
 		ID     string `json:"id"`
@@ -389,7 +396,7 @@ func (s *session) dispatch(t *turn, f frame) {
 		e = s.itemEvent(t, p, f.Method)
 	case "turn/completed":
 		e = s.turnFinishedEvent(t, p)
-	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", requestUserInputMethod:
+	case commandApprovalMethod, fileChangeApprovalMethod, requestUserInputMethod:
 		if len(f.ID) == 0 {
 			return
 		}
@@ -401,6 +408,9 @@ func (s *session) dispatch(t *turn, f frame) {
 }
 
 func (s *session) itemEvent(t *turn, p eventParams, method string) hp.Event {
+	if p.Item.Type == "fileChange" && method != itemCompletedMethod {
+		t.filePaths[p.Item.ID] = changePaths(p)
+	}
 	if method == itemCompletedMethod {
 		s.logCompletedItem(t, p)
 		if p.Item.Type == "agentMessage" && p.Item.Text != "" && !t.seenText[p.Item.ID] && !t.unattributedText {
@@ -417,6 +427,14 @@ func (s *session) itemEvent(t *turn, p eventParams, method string) hp.Event {
 		e.Kind = hp.EventItemFinished
 	}
 	return e
+}
+
+func changePaths(p eventParams) []string {
+	paths := make([]string, 0, len(p.Item.Changes))
+	for _, c := range p.Item.Changes {
+		paths = append(paths, c.Path)
+	}
+	return paths
 }
 
 func itemStatus(raw string) hp.ItemStatus {
@@ -470,13 +488,19 @@ func (s *session) requestEvent(t *turn, p eventParams, f frame) hp.Event {
 	if f.Method == requestUserInputMethod {
 		kind = hp.RequestUserInput
 	}
-	r := &hp.Request{ID: rid, Kind: kind, Title: f.Method, Options: []hp.Option{{ID: "accept", Label: "Accept"}, {ID: "decline", Label: "Decline"}, {ID: "cancel", Label: "Cancel"}}}
+	r := &hp.Request{ID: rid, Kind: kind, ItemID: p.ItemID, Options: []hp.Option{{ID: "accept", Label: "Accept"}, {ID: "decline", Label: "Decline"}, {ID: "cancel", Label: "Cancel"}}}
+	switch f.Method {
+	case commandApprovalMethod:
+		r.Approval = &hp.Approval{Action: hp.ActionCommand, Command: p.Command, Cwd: p.Cwd, Reason: p.Reason}
+	case fileChangeApprovalMethod:
+		r.Approval = &hp.Approval{Action: hp.ActionFileChange, Paths: t.filePaths[p.ItemID], WriteRoot: p.GrantRoot, Reason: p.Reason}
+	}
 	if kind == hp.RequestUserInput {
 		r.Options = nil
 		for _, q := range p.Questions {
-			question := hp.Question{ID: q.ID, Prompt: q.Question, AllowFreeText: true}
+			question := hp.Question{ID: q.ID, Header: q.Header, Prompt: q.Question, AllowFreeText: true}
 			for _, o := range q.Options {
-				question.Options = append(question.Options, hp.Option{ID: o.Label, Label: o.Label})
+				question.Options = append(question.Options, hp.Option{ID: o.Label, Label: o.Label, Description: o.Description})
 			}
 			r.Questions = append(r.Questions, question)
 		}
@@ -506,6 +530,7 @@ type turn struct {
 	events           chan hp.Event
 	pending          map[string]pendingRequest // protected by session.mu
 	seenText         map[string]bool
+	filePaths        map[string][]string // protected by session.mu
 	unattributedText bool
 	readDone         bool
 }
