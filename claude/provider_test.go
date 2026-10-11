@@ -209,8 +209,8 @@ func (p *peerState) userMessage(f peerFrame) {
 		p.result(map[string]any{"is_error": true, "result": "Invalid API key", "errors": []string{"[ede_diagnostic] noise", "boom"}})
 	case "approval", "interrupt":
 		p.toolRequest("perm-1", "Bash", map[string]any{"command": "touch approved.txt", "description": "Create file"}, "toolu_1")
-	case "question":
-		p.toolRequest("perm-1", "AskUserQuestion", map[string]any{"questions": []any{map[string]any{"question": "Which colour?", "header": "Colour", "options": []any{map[string]any{"label": "Red", "description": "r"}, map[string]any{"label": "Blue", "description": "b"}}, "multiSelect": true}}}, "toolu_1")
+	case "question", "duplicate_question":
+		p.question()
 	case "tools":
 		p.toolRequest("perm-1", "Edit", map[string]any{"file_path": "/work/a.go"}, "toolu_1")
 		p.toolRequest("perm-2", "NotebookEdit", map[string]any{"notebook_path": "/work/n.ipynb"}, "toolu_2")
@@ -225,6 +225,15 @@ func (p *peerState) userMessage(f peerFrame) {
 		p.text(true, true)
 		p.result(nil)
 	}
+}
+
+func (p *peerState) question() {
+	q := map[string]any{"question": "Which colour?", "header": "Colour"}
+	questions := []any{q, q}
+	if p.scenario == "question" {
+		questions = []any{map[string]any{"question": "Which colour?", "header": "Colour", "options": []any{map[string]any{"label": "Red", "description": "r"}, map[string]any{"label": "Blue", "description": "b"}}, "multiSelect": true}}
+	}
+	p.toolRequest("perm-1", "AskUserQuestion", map[string]any{"questions": questions}, "toolu_1")
 }
 
 // extra plays scenarios that exercise frame filtering rather than the normal turn flow.
@@ -655,15 +664,17 @@ func TestAskUserQuestion(t *testing.T) {
 	}
 	assert.Equal(t, hp.RequestUserInput, req.Kind)
 	assert.Nil(t, req.Approval)
+	assert.Equal(t, []hp.Option{{ID: "decline", Label: "Decline"}, {ID: "cancel", Label: "Cancel"}}, req.Options)
 	require.Len(t, req.Questions, 1)
 	q := req.Questions[0]
-	assert.Equal(t, "Which colour?", q.ID)
+	assert.Equal(t, "q0", q.ID)
 	assert.Equal(t, "Colour", q.Header)
 	assert.Equal(t, "Which colour?", q.Prompt)
 	assert.True(t, q.Multiple)
 	assert.Equal(t, []hp.Option{{ID: "Red", Label: "Red", Description: "r"}, {ID: "Blue", Label: "Blue", Description: "b"}}, q.Options)
 
-	require.NoError(t, turn.Respond(contextForTest(t), req.ID, hp.Response{Answers: map[string][]string{"Which colour?": {"Red", "Blue"}}}))
+	require.ErrorIs(t, turn.Respond(contextForTest(t), req.ID, hp.Response{OptionID: "accept"}), hp.ErrUnsupported)
+	require.NoError(t, turn.Respond(contextForTest(t), req.ID, hp.Response{Answers: map[string][]string{"q0": {"Red", "Blue"}}}))
 	sent := logs.received(t, func(m map[string]any) bool { return m["type"] == "control_response" })
 	payload := sent["response"].(map[string]any)["response"].(map[string]any)
 	assert.Equal(t, "allow", payload["behavior"])
@@ -672,6 +683,46 @@ func TestAskUserQuestion(t *testing.T) {
 	assert.Contains(t, updated, "questions")
 	events := collect(t, turn)
 	assert.Equal(t, hp.EventTurnFinished, events[len(events)-1].Kind)
+}
+
+func TestAskUserQuestionDecline(t *testing.T) {
+	s, logs := openFake(t, "question")
+	turn := startFake(t, s)
+	req := nextRequest(t, turn)
+	require.NoError(t, turn.Respond(contextForTest(t), req.ID, hp.Response{OptionID: "decline"}))
+	sent := logs.received(t, func(m map[string]any) bool { return m["type"] == "control_response" })
+	payload := sent["response"].(map[string]any)["response"].(map[string]any)
+	assert.Equal(t, "deny", payload["behavior"])
+	assert.NotContains(t, payload, "interrupt")
+	require.ErrorIs(t, turn.Respond(contextForTest(t), req.ID, hp.Response{OptionID: "decline"}), hp.ErrRequestNotFound)
+	collect(t, turn)
+}
+
+func TestAskUserQuestionCancel(t *testing.T) {
+	s, logs := openFake(t, "question")
+	turn := startFake(t, s)
+	req := nextRequest(t, turn)
+	require.ErrorIs(t, turn.Respond(contextForTest(t), req.ID, hp.Response{Answers: map[string][]string{"Which colour?": {"Red"}}}), hp.ErrUnsupported)
+	require.NoError(t, turn.Respond(contextForTest(t), req.ID, hp.Response{OptionID: "cancel"}))
+	sent := logs.received(t, func(m map[string]any) bool { return m["type"] == "control_response" })
+	payload := sent["response"].(map[string]any)["response"].(map[string]any)
+	assert.Equal(t, "deny", payload["behavior"])
+	assert.Equal(t, true, payload["interrupt"])
+	collect(t, turn)
+}
+
+func TestAskUserQuestionDuplicateText(t *testing.T) {
+	s, logs := openFake(t, "duplicate_question")
+	turn := startFake(t, s)
+	req := nextRequest(t, turn)
+	require.Len(t, req.Questions, 2)
+	assert.Equal(t, "q0", req.Questions[0].ID)
+	assert.Equal(t, "q1", req.Questions[1].ID)
+	require.NoError(t, turn.Respond(contextForTest(t), req.ID, hp.Response{Answers: map[string][]string{"q0": {"Red"}, "q1": {"Blue"}}}))
+	sent := logs.received(t, func(m map[string]any) bool { return m["type"] == "control_response" })
+	payload := sent["response"].(map[string]any)["response"].(map[string]any)
+	assert.Equal(t, map[string]any{"Which colour?": "Red, Blue"}, payload["updatedInput"].(map[string]any)["answers"])
+	collect(t, turn)
 }
 
 func TestFileChangeAndToolRequests(t *testing.T) {
@@ -953,6 +1004,9 @@ func TestEnvironmentConfigDir(t *testing.T) {
 	explicit := environment("/explicit", nil)
 	assert.Contains(t, explicit, "CLAUDE_CONFIG_DIR=/explicit")
 	assert.NotContains(t, explicit, "CLAUDE_CONFIG_DIR=/ambient")
+	assert.Contains(t, explicit, "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1")
+	overridden := environment("", []string{"CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=0"})
+	assert.Equal(t, "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1", overridden[len(overridden)-1])
 }
 
 func TestOpenRejectsFileWorkspace(t *testing.T) {
@@ -1136,7 +1190,7 @@ func TestReplayFixtures(t *testing.T) {
 		assert.Equal(t, hp.RequestUserInput, req.Kind)
 		require.Len(t, req.Questions, 1)
 		q := req.Questions[0]
-		assert.Equal(t, "Which colour do you prefer?", q.ID)
+		assert.Equal(t, "q0", q.ID)
 		labels := make([]string, len(q.Options))
 		for i, o := range q.Options {
 			labels[i] = o.Label
@@ -1146,7 +1200,7 @@ func TestReplayFixtures(t *testing.T) {
 		sent := logs.received(t, func(m map[string]any) bool { return m["type"] == "control_response" })
 		payload := sent["response"].(map[string]any)["response"].(map[string]any)
 		answers := payload["updatedInput"].(map[string]any)["answers"].(map[string]any)
-		assert.Equal(t, "Blue", answers[q.ID])
+		assert.Equal(t, "Blue", answers["Which colour do you prefer?"])
 		events := collect(t, turn)
 		assert.Contains(t, joinText(events), "Blue")
 		assert.Equal(t, hp.OutcomeCompleted, events[len(events)-1].Outcome.Status)

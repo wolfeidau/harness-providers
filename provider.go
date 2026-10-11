@@ -201,6 +201,6 @@ type Question struct {
 }
 
 type Response struct {
-	OptionID string              // approval choice, if applicable
+	OptionID string              // chosen Option; empty answers a user_input request from Answers
 	Answers  map[string][]string // question ID -> answers
 }
