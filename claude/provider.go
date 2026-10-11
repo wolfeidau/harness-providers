@@ -9,11 +9,11 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
-	"unicode/utf8"
 	"uuid"
 
 	hp "github.com/wolfeidau/harness-providers"
@@ -32,9 +32,7 @@ type Provider struct{ config Config }
 const (
 	providerName    = "claude"
 	cursorVersion   = 1
-	eventBufferSize = 256
-	earlyBufferSize = 256
-	toolInputLimit  = 2048
+	eventBufferSize = 1024
 	typeField       = "type"
 	roleUser        = "user"
 	fieldText       = "text"
@@ -95,7 +93,8 @@ func launchArgs(key launchKey, sessionID string, resume bool, extra []string) []
 	never := key.policy.Approval == hp.ApprovalNever
 	switch key.policy.Sandbox {
 	case hp.SandboxReadOnly:
-		args = append(args, "--tools", "Read,Glob,Grep", "--strict-mcp-config", "--permission-mode", "dontAsk")
+		// Project and local settings can define hooks that would run outside the read-only tool set.
+		args = append(args, "--tools", "Read,Glob,Grep", "--strict-mcp-config", "--setting-sources", "user", "--permission-mode", "dontAsk")
 	case hp.SandboxWorkspaceWrite:
 		args = append(args, "--permission-mode", "acceptEdits", "--settings", sandboxSettings)
 		if never {
@@ -104,11 +103,8 @@ func launchArgs(key launchKey, sessionID string, resume bool, extra []string) []
 	case hp.SandboxUnrestricted:
 		if never {
 			args = append(args, "--permission-mode", "bypassPermissions")
-		} else {
-			args = append(args, "--permission-mode", "default")
 		}
 	default:
-		args = append(args, "--permission-mode", "default")
 		if never {
 			args = append(args, "--permission-prompts", "none")
 		}
@@ -128,7 +124,6 @@ type session struct {
 	key       launchKey
 	started   bool // whether a turn has run, so the native session exists on disk
 	active    *turn
-	early     []frame
 	closed    bool
 }
 
@@ -154,11 +149,16 @@ func (p *Provider) Open(ctx context.Context, in hp.OpenRequest) (hp.Session, err
 		s.sessionID = uuid.NewV4().String()
 	}
 	s.logger.DebugContext(ctx, "claude session opening", "resume", s.started)
-	c, err := s.spawn(ctx, s.key)
-	if err != nil {
-		return nil, err
+	if s.started {
+		// Resume spawns now so a missing session is reported by Open.
+		c, err := s.spawn(ctx, s.key)
+		if err != nil {
+			return nil, err
+		}
+		s.client = c
+	} else if _, err = exec.LookPath(s.cfg.Binary); err != nil {
+		return nil, fmt.Errorf("claude binary: %w", err)
 	}
-	s.client = c
 	s.logger.DebugContext(ctx, "claude session opened", "session_id", s.sessionID, "resume", s.started)
 	return s, nil
 }
@@ -274,34 +274,24 @@ func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, erro
 		s.mu.Unlock()
 		return nil, hp.ErrClosed
 	}
-	if s.active != nil {
+	if s.busy() {
 		s.mu.Unlock()
 		return nil, hp.ErrBusy
 	}
 	t := &turn{s: s, id: uuid.NewV4().String(), admitted: make(chan struct{}), events: make(chan hp.Event, eventBufferSize), pending: make(map[string]pendingRequest), seenText: make(map[string]bool), items: make(map[string]string)}
 	s.active = t
-	s.early = nil
-	respawn := key != s.key
 	old := s.client
-	t.client = old
+	respawn := old == nil || old.failed() || key != s.key
+	if respawn {
+		s.client = nil // a nil client keeps the turn busy while the child starts
+	} else {
+		t.client = old
+	}
 	s.mu.Unlock()
 	if respawn {
-		s.logger.DebugContext(ctx, "claude respawning for changed launch settings", "session_id", s.sessionID)
-		_ = old.close()
-		c, err := s.spawn(ctx, key)
-		s.mu.Lock()
-		switch {
-		case err != nil:
-			s.closed = true
-			s.mu.Unlock()
+		if err = s.launch(ctx, t, key, old); err != nil {
 			return nil, err
-		case s.closed:
-			s.mu.Unlock()
-			_ = c.close()
-			return nil, hp.ErrClosed
 		}
-		s.client, s.key, t.client = c, key, c
-		s.mu.Unlock()
 	}
 	s.logger.DebugContext(ctx, "claude turn admission requested", "session_id", s.sessionID, "turn_id", t.id)
 	userMsg := map[string]any{typeField: roleUser, fieldMessage: map[string]any{"role": roleUser, "content": parts}, "parent_tool_use_id": nil, "session_id": "", "uuid": t.id}
@@ -329,6 +319,33 @@ func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, erro
 	return t, nil
 }
 
+// A turn whose child has failed can no longer finish, so it does not block the next one. Callers must hold s.mu.
+func (s *session) busy() bool {
+	a := s.active
+	return a != nil && (a.client == nil || !a.client.failed())
+}
+
+// launch replaces the child for t; callers have already detached old from the session.
+func (s *session) launch(ctx context.Context, t *turn, key launchKey, old *client) error {
+	s.logger.DebugContext(ctx, "claude spawning for turn", "session_id", s.sessionID)
+	if old != nil {
+		_ = old.close()
+	}
+	c, err := s.spawn(ctx, key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case err != nil:
+		s.closed = true
+		return fmt.Errorf("claude spawn (session closed): %w", err)
+	case s.closed:
+		_ = c.close()
+		return hp.ErrClosed
+	}
+	s.client, s.key, t.client = c, key, c
+	return nil
+}
+
 func (s *session) receive(gen int, f frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -350,23 +367,31 @@ func (s *session) receive(gen int, f frame) {
 		t.isAdmitted = true
 		close(t.admitted)
 		s.enqueue(t, hp.Event{Kind: hp.EventTurnStarted, TurnID: t.id})
-		early := s.early
-		s.early = nil
-		for _, ef := range early {
-			s.dispatch(t, ef)
-		}
 		return
 	}
-	if len(s.early) < earlyBufferSize {
-		s.early = append(s.early, f)
+	// Anything else before admission is a straggler from the previous turn.
+	if f.Type == frameControlRequest && s.client != nil {
+		_ = s.client.reject(f.RequestID, "no admitted Claude turn")
+	}
+}
+
+// Callers must hold s.mu.
+func (s *session) checkInit(t *turn, f frame) {
+	if f.Subtype != "init" || f.SessionID == s.sessionID {
 		return
 	}
-	s.logger.Warn("claude early event buffer full", "session_id", s.sessionID)
-	t.client.fail(fmt.Errorf("claude early event buffer full"))
+	s.logger.Warn("claude session identity mismatch", "session_id", s.sessionID)
+	s.closed = true
+	t.client.fail(errors.New("claude session identity mismatch"))
+	// close waits for the reader that is running this callback.
+	go func() { _ = t.client.close() }()
 }
 
 // Callers must hold s.mu.
 func (s *session) dispatch(t *turn, f frame) {
+	if f.fromSubagent() && (f.Type == "stream_event" || f.Type == "assistant" || f.Type == "user") {
+		return
+	}
 	switch f.Type {
 	case "stream_event":
 		if f.Event != nil && f.Event.Type == "content_block_delta" && f.Event.Delta.Type == "text_delta" {
@@ -378,13 +403,7 @@ func (s *session) dispatch(t *turn, f frame) {
 	case "user":
 		s.toolResultEvents(t, f)
 	case "system":
-		if f.Subtype == "init" && f.SessionID != s.sessionID {
-			s.logger.Warn("claude session identity mismatch", "session_id", s.sessionID)
-			s.closed = true
-			t.client.fail(errors.New("claude session identity mismatch"))
-			// close waits for the reader that is running this callback.
-			go func() { _ = t.client.close() }()
-		}
+		s.checkInit(t, f)
 	case frameControlRequest:
 		s.requestEvent(t, f)
 	case frameControlCancel:
@@ -468,6 +487,7 @@ func (s *session) resultEvents(t *turn, f frame) {
 		out.Error = failureDetail(f)
 	}
 	s.enqueue(t, hp.Event{Kind: hp.EventTurnFinished, TurnID: t.id, Outcome: out})
+	clear(t.pending)
 	s.active = nil
 	s.logger.Debug("claude turn finished", "session_id", s.sessionID, "turn_id", t.id, "outcome", string(out.Status))
 }
@@ -534,22 +554,11 @@ func (s *session) requestEvent(t *turn, f frame) {
 			r.Approval.Paths = []string{path}
 		}
 	default:
-		r.Approval = &hp.Approval{Action: hp.ActionTool, Tool: req.ToolName, Command: truncate(string(req.Input), toolInputLimit), Reason: req.Description}
+		r.Approval = &hp.Approval{Action: hp.ActionTool, Tool: req.ToolName, Command: string(req.Input), Reason: req.Description}
 	}
 	t.pending[f.RequestID] = pendingRequest{tool: req.ToolName, input: req.Input}
 	s.logger.Debug("claude tool permission request", "session_id", s.sessionID, "turn_id", t.id, "request_id", f.RequestID)
 	s.enqueue(t, hp.Event{Kind: hp.EventRequest, TurnID: t.id, Request: r})
-}
-
-func truncate(v string, limit int) string {
-	if len(v) <= limit {
-		return v
-	}
-	v = v[:limit]
-	for !utf8.ValidString(v) {
-		v = v[:len(v)-1]
-	}
-	return v
 }
 
 func (s *session) enqueue(t *turn, e hp.Event) {
@@ -626,6 +635,9 @@ func (t *turn) Respond(ctx context.Context, id string, response hp.Response) err
 func (t *turn) takePending(id string, response hp.Response) (map[string]any, error) {
 	t.s.mu.Lock()
 	defer t.s.mu.Unlock()
+	if t.s.closed {
+		return nil, hp.ErrClosed
+	}
 	p, ok := t.pending[id]
 	if !ok {
 		return nil, hp.ErrRequestNotFound
@@ -662,8 +674,11 @@ func (t *turn) takePending(id string, response hp.Response) (map[string]any, err
 
 func (t *turn) Interrupt(ctx context.Context) error {
 	t.s.mu.Lock()
-	active := t.s.active == t
+	active, closed := t.s.active == t, t.s.closed
 	t.s.mu.Unlock()
+	if closed {
+		return hp.ErrClosed
+	}
 	if !active {
 		t.s.logger.DebugContext(ctx, "claude interrupt skipped", "turn_id", t.id, "reason", "inactive")
 		return nil

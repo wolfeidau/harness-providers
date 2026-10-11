@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	hp "github.com/wolfeidau/harness-providers"
 	"github.com/wolfeidau/harness-providers/internal/subprocess"
 )
 
@@ -112,6 +112,7 @@ type frame struct {
 	CommandUUID     string           `json:"command_uuid"`
 	SessionID       string           `json:"session_id"`
 	APIMessageID    string           `json:"api_message_id"`
+	ParentToolUseID json.RawMessage  `json:"parent_tool_use_id"`
 	UserMessageUUID string           `json:"user_message_uuid"`
 	Event           *streamEvent     `json:"event"`
 	Message         *message         `json:"message"`
@@ -121,6 +122,11 @@ type frame struct {
 	Result          string           `json:"result"`
 	TerminalReason  string           `json:"terminal_reason"`
 	Usage           *usage           `json:"usage"`
+}
+
+// fromSubagent reports whether the frame belongs to a nested Task agent rather than the main turn.
+func (f frame) fromSubagent() bool {
+	return len(f.ParentToolUseID) > 0 && string(f.ParentToolUseID) != "null"
 }
 
 type reply struct {
@@ -233,8 +239,9 @@ func (c *client) read(r io.Reader) {
 	for s.Scan() {
 		var f frame
 		if err := json.Unmarshal(s.Bytes(), &f); err != nil {
-			c.fail(fmt.Errorf("decode claude frame: %w", err))
-			return
+			// Unknown shapes must not fail the transport; log only the size to keep content out of logs.
+			c.logger.Debug("claude frame skipped", "bytes", len(s.Bytes()))
+			continue
 		}
 		c.handleFrame(f)
 	}
@@ -354,7 +361,7 @@ func (c *client) close() error {
 		c.mu.Lock()
 		c.closing = true
 		c.mu.Unlock()
-		c.fail(errors.New("claude closed"))
+		c.fail(fmt.Errorf("claude closed: %w", hp.ErrClosed))
 		_ = c.stdin.Close()
 		select {
 		case <-c.waitDone:
@@ -368,6 +375,15 @@ func (c *client) close() error {
 		}
 	})
 	return nil
+}
+
+func (c *client) failed() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *client) failure() error {

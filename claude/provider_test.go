@@ -51,6 +51,7 @@ type peerState struct {
 	turn        string
 	outstanding int
 	pendingIDs  []string
+	fresh       bool // launched with --session-id, i.e. not a respawn
 }
 
 func (p *peerState) write(v any) {
@@ -92,7 +93,7 @@ func TestFakePeer(t *testing.T) {
 	args := flag.Args()
 	argv, _ := json.Marshal(args)
 	appendLine(os.Getenv("HARNESS_FAKE_ARGVLOG"), string(argv))
-	p := &peerState{w: bufio.NewWriter(os.Stdout), scenario: os.Getenv("HARNESS_FAKE_SCENARIO"), sid: argValue(args, "--session-id")}
+	p := &peerState{w: bufio.NewWriter(os.Stdout), scenario: os.Getenv("HARNESS_FAKE_SCENARIO"), sid: argValue(args, "--session-id"), fresh: slices.Contains(args, "--session-id")}
 	if p.sid == "" {
 		p.sid = argValue(args, "--resume")
 	}
@@ -184,6 +185,11 @@ func (p *peerState) userMessage(f peerFrame) {
 	case "exit":
 		p.lifecycle("queued")
 		os.Exit(3)
+	case "exit_first":
+		if p.fresh {
+			p.lifecycle("queued")
+			os.Exit(3)
+		}
 	}
 	p.lifecycle("queued")
 	p.lifecycle("started")
@@ -209,11 +215,42 @@ func (p *peerState) userMessage(f peerFrame) {
 		p.toolRequest("perm-1", "Edit", map[string]any{"file_path": "/work/a.go"}, "toolu_1")
 		p.toolRequest("perm-2", "NotebookEdit", map[string]any{"notebook_path": "/work/n.ipynb"}, "toolu_2")
 		p.toolRequest("perm-3", "WebFetch", map[string]any{"url": strings.Repeat("u", 5000)}, "toolu_3")
+	case "subagent", "result_pending", "foreign_result", "junk":
+		p.extra()
 	case "unknown_control":
 		p.write(map[string]any{"type": "control_request", "request_id": "m1", "request": map[string]any{"subtype": "mystery"}})
 		p.outstanding = 1
 		p.pendingIDs = []string{"m1"}
 	default:
+		p.text(true, true)
+		p.result(nil)
+	}
+}
+
+// extra plays scenarios that exercise frame filtering rather than the normal turn flow.
+func (p *peerState) extra() {
+	switch p.scenario {
+	case "subagent":
+		sub := func(m map[string]any) {
+			m["parent_tool_use_id"] = "toolu_parent"
+			p.write(m)
+		}
+		sub(map[string]any{"type": "stream_event", "event": map[string]any{"type": "content_block_delta", "delta": map[string]any{"type": "text_delta", "text": "SUB"}}, "api_message_id": "msg_sub"})
+		sub(map[string]any{"type": "assistant", "message": map[string]any{"id": "msg_sub", "content": []any{map[string]any{"type": "text", "text": "SUB"}, map[string]any{"type": "tool_use", "id": "toolu_sub", "name": "Bash", "input": map[string]any{"command": "ls"}}}}})
+		sub(map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "toolu_sub"}}}})
+		p.write(map[string]any{"type": "control_request", "request_id": "perm-1", "parent_tool_use_id": "toolu_parent", "request": map[string]any{"subtype": "can_use_tool", "tool_name": "Bash", "input": map[string]any{"command": "ls"}, "tool_use_id": "toolu_sub"}})
+		p.pendingIDs = append(p.pendingIDs, "perm-1")
+		p.outstanding++
+	case "result_pending":
+		p.toolRequest("perm-1", "Bash", map[string]any{"command": "ls"}, "toolu_1")
+		p.result(nil)
+	case "foreign_result":
+		p.result(map[string]any{"user_message_uuid": "other-turn"})
+		p.text(true, true)
+		p.result(nil)
+	case "junk":
+		p.emit("not json {", "", nil)
+		p.write(map[string]any{"type": "assistant", "errors": []any{map[string]any{"x": 1}}})
 		p.text(true, true)
 		p.result(nil)
 	}
@@ -478,9 +515,10 @@ func TestTextTurnEventsAndEOF(t *testing.T) {
 	var cd cursorData
 	require.NoError(t, json.Unmarshal(cursor.Data, &cd))
 	require.NotEmpty(t, cd.SessionID)
-	assert.Equal(t, [][]string{launchArgs(launchKey{}, cd.SessionID, false, nil)}, logs.argvs(t))
+	assert.Empty(t, logs.argvs(t), "Open must not spawn a new session")
 
 	turn := startFake(t, s)
+	assert.Equal(t, [][]string{launchArgs(launchKey{}, cd.SessionID, false, nil)}, logs.argvs(t))
 	events := collect(t, turn)
 	assert.Equal(t, []hp.EventKind{hp.EventTurnStarted, hp.EventTextDelta, hp.EventUsage, hp.EventTurnFinished}, kinds(events))
 	assert.Equal(t, hp.Event{Kind: hp.EventTextDelta, TurnID: turn.ID(), ItemID: fakeMessageID, Text: "pong"}, events[1])
@@ -590,6 +628,22 @@ func TestInterruptWithPendingRequest(t *testing.T) {
 	require.NoError(t, turn.Interrupt(contextForTest(t)))
 }
 
+func TestSubagentFramesAreIgnoredButRequestsSurface(t *testing.T) {
+	s, _ := openFake(t, "subagent")
+	turn := startFake(t, s)
+	req := nextRequest(t, turn)
+	assert.Equal(t, "perm-1", req.ID)
+	require.NoError(t, turn.Respond(contextForTest(t), req.ID, hp.Response{OptionID: "accept"}))
+	events := collect(t, turn)
+	assert.Equal(t, "pong", joinText(events))
+	for _, e := range events {
+		assert.NotEqual(t, hp.EventItemStarted, e.Kind)
+	}
+	for _, it := range finishedItems(events) {
+		assert.NotEqual(t, "toolu_sub", it.Label)
+	}
+}
+
 func TestAskUserQuestion(t *testing.T) {
 	s, logs := openFake(t, "question")
 	turn := startFake(t, s)
@@ -634,8 +688,7 @@ func TestFileChangeAndToolRequests(t *testing.T) {
 	tool := reqs[2].Approval
 	assert.Equal(t, hp.ActionTool, tool.Action)
 	assert.Equal(t, "WebFetch", tool.Tool)
-	assert.Len(t, tool.Command, toolInputLimit)
-	assert.True(t, strings.HasPrefix(tool.Command, `{"url":"uuu`))
+	assert.Equal(t, `{"url":"`+strings.Repeat("u", 5000)+`"}`, tool.Command)
 }
 
 func TestResultErrorWithSuccessSubtypeFails(t *testing.T) {
@@ -644,6 +697,41 @@ func TestResultErrorWithSuccessSubtypeFails(t *testing.T) {
 	out := events[len(events)-1].Outcome
 	assert.Equal(t, hp.OutcomeFailed, out.Status)
 	assert.Equal(t, "boom", out.Error)
+}
+
+func TestResultClearsPendingRequests(t *testing.T) {
+	s, _ := openFake(t, "result_pending")
+	turn := startFake(t, s)
+	req := nextRequest(t, turn)
+	collect(t, turn)
+	require.ErrorIs(t, turn.Respond(contextForTest(t), req.ID, hp.Response{OptionID: "accept"}), hp.ErrRequestNotFound)
+}
+
+func TestForeignResultIsIgnored(t *testing.T) {
+	s, _ := openFake(t, "foreign_result")
+	events := collect(t, startFake(t, s))
+	assert.Equal(t, []hp.EventKind{hp.EventTurnStarted, hp.EventTextDelta, hp.EventUsage, hp.EventTurnFinished}, kinds(events))
+}
+
+func TestUndecodableFramesAreSkipped(t *testing.T) {
+	s, _ := openFake(t, "junk")
+	events := collect(t, startFake(t, s))
+	assert.Equal(t, "pong", joinText(events))
+	assert.Equal(t, hp.OutcomeCompleted, events[len(events)-1].Outcome.Status)
+}
+
+func TestCloseSurfacesErrClosed(t *testing.T) {
+	s, _ := openFake(t, "approval")
+	turn := startFake(t, s)
+	req := nextRequest(t, turn)
+	require.NoError(t, s.Close())
+	var err error
+	for err == nil {
+		_, err = turn.Next(contextForTest(t))
+	}
+	require.ErrorIs(t, err, hp.ErrClosed)
+	require.ErrorIs(t, turn.Respond(contextForTest(t), req.ID, hp.Response{OptionID: "accept"}), hp.ErrClosed)
+	require.ErrorIs(t, turn.Interrupt(contextForTest(t)), hp.ErrClosed)
 }
 
 func TestFailureDetail(t *testing.T) {
@@ -712,6 +800,7 @@ func TestChildExitFailsTurn(t *testing.T) {
 		_, err = turn.Next(contextForTest(t))
 	}
 	require.NotErrorIs(t, err, io.EOF)
+	require.NotErrorIs(t, err, hp.ErrClosed)
 	require.ErrorContains(t, err, "exit status 3")
 }
 
@@ -745,6 +834,7 @@ func TestRespawnOnSettingsChange(t *testing.T) {
 	}
 	run("")
 	require.Len(t, logs.argvs(t), 1)
+	assert.Equal(t, launchArgs(launchKey{}, cd.SessionID, false, nil), logs.argvs(t)[0])
 	run("model-a")
 	run("model-a")
 	run("model-b")
@@ -755,7 +845,7 @@ func TestRespawnOnSettingsChange(t *testing.T) {
 	assert.Equal(t, id, s.Cursor())
 }
 
-func TestRespawnBeforeFirstTurnReusesSessionID(t *testing.T) {
+func TestFirstTurnSpawnsOnceWithSessionID(t *testing.T) {
 	p, logs := fakeProvider(t, "normal")
 	s, err := p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir()})
 	require.NoError(t, err)
@@ -766,10 +856,32 @@ func TestRespawnBeforeFirstTurnReusesSessionID(t *testing.T) {
 	require.NoError(t, err)
 	collect(t, turn)
 	argvs := logs.argvs(t)
+	require.Len(t, argvs, 1)
+	assert.Contains(t, argvs[0], "--session-id")
+	assert.NotContains(t, argvs[0], "--resume")
+	assert.Equal(t, "low", argValue(argvs[0], "--effort"))
+}
+
+func TestOpenRejectsUnresolvableBinary(t *testing.T) {
+	_, err := New(Config{Binary: filepath.Join(t.TempDir(), "missing-claude")}).Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir()})
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestSessionRecoversAfterChildExit(t *testing.T) {
+	s, logs := openFake(t, "exit_first")
+	turn := startFake(t, s)
+	var err error
+	for err == nil {
+		_, err = turn.Next(contextForTest(t))
+	}
+	require.ErrorContains(t, err, "exit status 3")
+	second := startFake(t, s)
+	assert.Equal(t, hp.EventTurnFinished, collect(t, second)[3].Kind)
+	argvs := logs.argvs(t)
 	require.Len(t, argvs, 2)
-	assert.Contains(t, argvs[1], "--session-id")
-	assert.NotContains(t, argvs[1], "--resume")
-	assert.Equal(t, "low", argValue(argvs[1], "--effort"))
+	assert.Contains(t, argvs[0], "--session-id")
+	assert.Contains(t, argvs[1], "--resume")
+	assert.NotContains(t, argvs[1], "--session-id")
 }
 
 func TestLaunchArgs(t *testing.T) {
@@ -782,16 +894,17 @@ func TestLaunchArgs(t *testing.T) {
 		extra  []string
 		want   []string
 	}{
-		{name: "default", want: []string{"--permission-mode", "default"}},
-		{name: "model effort", key: launchKey{model: "m", effort: "max"}, want: []string{"--model", "m", "--effort", "max", "--permission-mode", "default"}},
-		{name: "default never", key: launchKey{policy: hp.ExecutionPolicy{Approval: hp.ApprovalNever}}, want: []string{"--permission-mode", "default", "--permission-prompts", "none"}},
-		{name: "read only", key: launchKey{policy: hp.ExecutionPolicy{Sandbox: hp.SandboxReadOnly}}, want: []string{"--tools", "Read,Glob,Grep", "--strict-mcp-config", "--permission-mode", "dontAsk"}},
-		{name: "read only never", key: launchKey{policy: hp.ExecutionPolicy{Sandbox: hp.SandboxReadOnly, Approval: hp.ApprovalNever}}, want: []string{"--tools", "Read,Glob,Grep", "--strict-mcp-config", "--permission-mode", "dontAsk"}},
+		{name: "default"},
+		{name: "model effort", key: launchKey{model: "m", effort: "max"}, want: []string{"--model", "m", "--effort", "max"}},
+		{name: "default never", key: launchKey{policy: hp.ExecutionPolicy{Approval: hp.ApprovalNever}}, want: []string{"--permission-prompts", "none"}},
+		{name: "read only", key: launchKey{policy: hp.ExecutionPolicy{Sandbox: hp.SandboxReadOnly}}, want: []string{"--tools", "Read,Glob,Grep", "--strict-mcp-config", "--setting-sources", "user", "--permission-mode", "dontAsk"}},
+		{name: "read only never", key: launchKey{policy: hp.ExecutionPolicy{Sandbox: hp.SandboxReadOnly, Approval: hp.ApprovalNever}}, want: []string{"--tools", "Read,Glob,Grep", "--strict-mcp-config", "--setting-sources", "user", "--permission-mode", "dontAsk"}},
 		{name: "workspace write", key: launchKey{policy: hp.ExecutionPolicy{Sandbox: hp.SandboxWorkspaceWrite, Approval: hp.ApprovalOnRequest}}, want: []string{"--permission-mode", "acceptEdits", "--settings", sandboxSettings}},
 		{name: "workspace write never", key: launchKey{policy: hp.ExecutionPolicy{Sandbox: hp.SandboxWorkspaceWrite, Approval: hp.ApprovalNever}}, want: []string{"--permission-mode", "acceptEdits", "--settings", sandboxSettings, "--permission-prompts", "none"}},
-		{name: "unrestricted", key: launchKey{policy: hp.ExecutionPolicy{Sandbox: hp.SandboxUnrestricted}}, want: []string{"--permission-mode", "default"}},
+		{name: "unrestricted", key: launchKey{policy: hp.ExecutionPolicy{Sandbox: hp.SandboxUnrestricted}}},
+		{name: "unrestricted on request", key: launchKey{policy: hp.ExecutionPolicy{Sandbox: hp.SandboxUnrestricted, Approval: hp.ApprovalOnRequest}}},
 		{name: "unrestricted never", key: launchKey{policy: hp.ExecutionPolicy{Sandbox: hp.SandboxUnrestricted, Approval: hp.ApprovalNever}}, want: []string{"--permission-mode", "bypassPermissions"}},
-		{name: "resume and extra", resume: true, extra: []string{"--foo"}, want: []string{"--permission-mode", "default", "--foo"}},
+		{name: "resume and extra", resume: true, extra: []string{"--foo"}, want: []string{"--foo"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -851,12 +964,6 @@ func TestOpenRejectsFileWorkspace(t *testing.T) {
 	assert.Equal(t, "claude", New(Config{}).Name())
 }
 
-func TestTruncateKeepsRunes(t *testing.T) {
-	assert.Equal(t, "ab", truncate("abc", 2))
-	assert.Equal(t, "a", truncate("aé", 2))
-	assert.Equal(t, "abc", truncate("abc", 3))
-}
-
 type lockedBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -903,7 +1010,7 @@ func TestCloseKillsProcessGroupAndDoesNotHang(t *testing.T) {
 	t.Cleanup(func() { closeGrace = prev })
 	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
 	p, _ := fakeProvider(t, "grandchild", "HARNESS_FAKE_PIDFILE="+pidFile)
-	s, err := p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir()})
+	s, err := p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir(), Resume: &hp.Cursor{Provider: "claude", Version: 1, Data: json.RawMessage(`{"sessionId":"s-1"}`)}})
 	require.NoError(t, err)
 	raw, err := os.ReadFile(pidFile) //nolint:gosec // Test-controlled path.
 	require.NoError(t, err)
