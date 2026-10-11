@@ -269,11 +269,27 @@ func TestExitAndResumeErrors(t *testing.T) {
 	require.Error(t, err)
 	require.NotErrorIs(t, err, io.EOF)
 	require.ErrorContains(t, err, "exit status 3")
+	require.NotErrorIs(t, err, hp.ErrClosed)
+	_, err = s.StartTurn(contextForTest(t), hp.TurnInput{Parts: []hp.InputPart{{Kind: hp.InputText, Text: "again"}}})
+	require.ErrorIs(t, err, hp.ErrClosed)
+	require.NotErrorIs(t, err, hp.ErrBusy)
 	p := fakeProvider(t, "missing")
 	_, err = p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir(), Resume: &hp.Cursor{Provider: "codex", Version: 1, Data: json.RawMessage(`{"threadId":"thread-1"}`)}})
 	require.ErrorIs(t, err, hp.ErrSessionNotFound)
 	_, err = p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir(), Resume: &hp.Cursor{Provider: "claude", Version: 1, Data: json.RawMessage(`{}`)}})
 	require.ErrorIs(t, err, hp.ErrInvalidCursor)
+}
+
+func TestClosedSessionReturnsErrClosed(t *testing.T) {
+	s := openFake(t, "approval")
+	turn := startFake(t, s)
+	e := next(t, turn)
+	require.Equal(t, hp.EventRequest, e.Kind)
+	require.NoError(t, s.Close())
+	_, err := turn.Next(contextForTest(t))
+	require.ErrorIs(t, err, hp.ErrClosed)
+	require.ErrorIs(t, turn.Respond(contextForTest(t), e.Request.ID, hp.Response{OptionID: "decline"}), hp.ErrClosed)
+	require.ErrorIs(t, turn.Interrupt(contextForTest(t)), hp.ErrClosed)
 }
 
 func TestUncertainStartClosesSession(t *testing.T) {

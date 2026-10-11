@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	hp "github.com/wolfeidau/harness-providers"
 	"github.com/wolfeidau/harness-providers/internal/subprocess"
 )
 
@@ -271,7 +271,7 @@ func (c *client) close() error {
 		c.mu.Lock()
 		c.closing = true
 		c.mu.Unlock()
-		c.fail(errors.New("codex app-server closed"))
+		c.fail(fmt.Errorf("codex app-server closed: %w", hp.ErrClosed))
 		_ = c.stdin.Close()
 		select {
 		case <-c.waitDone:
