@@ -10,7 +10,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,6 +39,7 @@ func TestFakePeer(t *testing.T) {
 		write := func(v any) { writeFakeFrame(w, v) }
 		switch f.Method {
 		case "initialize":
+			spawnFakeGrandchild(scenario)
 			write(map[string]any{"id": f.ID, "result": map[string]any{}})
 		case "thread/start":
 			write(map[string]any{"id": f.ID, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}})
@@ -60,7 +63,29 @@ func TestFakePeer(t *testing.T) {
 			}
 		}
 	}
+	fakeExit(scenario)
+}
+
+func fakeExit(scenario string) {
+	if scenario == "grandchild" {
+		select {} // ignore stdin EOF so only the kill can stop us
+	}
 	os.Exit(0)
+}
+
+func spawnFakeGrandchild(scenario string) {
+	if scenario != "grandchild" {
+		return
+	}
+	gc := exec.Command("sleep", "60")
+	gc.Stdout, gc.Stderr = os.Stdout, os.Stderr
+	if err := gc.Start(); err != nil {
+		os.Exit(2)
+	}
+	pid := []byte(strconv.Itoa(gc.Process.Pid))
+	if err := os.WriteFile(os.Getenv("HARNESS_FAKE_PIDFILE"), pid, 0600); err != nil {
+		os.Exit(2)
+	}
 }
 
 func writeFakeFrame(w *bufio.Writer, v any) {
@@ -122,14 +147,14 @@ func fakeTurnStart(write func(any), f frame, scenario string) {
 	}
 }
 
-func fakeProvider(t *testing.T, scenario string) *Provider {
+func fakeProvider(t *testing.T, scenario string, extraEnv ...string) *Provider {
 	t.Helper()
 	bin, err := os.Executable()
 	require.NoError(t, err)
 	script := filepath.Join(t.TempDir(), "fake-codex")
 	content := "#!/bin/sh\nexec '" + strings.ReplaceAll(bin, "'", "'\\''") + "' -test.run=^TestFakePeer$\n"
 	require.NoError(t, os.WriteFile(script, []byte(content), 0700))
-	return New(Config{Binary: script, Env: []string{"HARNESS_FAKE_PEER=1", "HARNESS_FAKE_SCENARIO=" + scenario}})
+	return New(Config{Binary: script, Env: append([]string{"HARNESS_FAKE_PEER=1", "HARNESS_FAKE_SCENARIO=" + scenario}, extraEnv...)})
 }
 func contextForTest(t *testing.T) context.Context {
 	t.Helper()
@@ -242,6 +267,7 @@ func TestExitAndResumeErrors(t *testing.T) {
 	_, err := turn.Next(contextForTest(t))
 	require.Error(t, err)
 	require.NotErrorIs(t, err, io.EOF)
+	require.ErrorContains(t, err, "exit status 3")
 	p := fakeProvider(t, "missing")
 	_, err = p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir(), Resume: &hp.Cursor{Provider: "codex", Version: 1, Data: json.RawMessage(`{"threadId":"thread-1"}`)}})
 	require.ErrorIs(t, err, hp.ErrSessionNotFound)
@@ -435,4 +461,28 @@ func TestOpenRejectsFileWorkspace(t *testing.T) {
 	_, err := New(Config{}).Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: file})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, syscall.ENOTDIR))
+}
+
+func TestCloseKillsProcessGroupAndDoesNotHang(t *testing.T) {
+	prev := closeGrace
+	closeGrace = 100 * time.Millisecond
+	t.Cleanup(func() { closeGrace = prev })
+	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
+	s, err := fakeProvider(t, "grandchild", "HARNESS_FAKE_PIDFILE="+pidFile).Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir()})
+	require.NoError(t, err)
+	raw, err := os.ReadFile(pidFile) //nolint:gosec // Test-controlled path.
+	require.NoError(t, err)
+	pid, err := strconv.Atoi(string(raw))
+	require.NoError(t, err)
+	require.NoError(t, syscall.Kill(pid, 0))
+
+	done := make(chan error, 1)
+	go func() { done <- s.Close() }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return")
+	}
+	require.Eventually(t, func() bool { return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) }, 2*time.Second, 10*time.Millisecond)
 }

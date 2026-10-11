@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type rpcError struct {
@@ -26,7 +27,13 @@ const (
 	requestUserInputMethod   = "item/tool/requestUserInput"
 	commandApprovalMethod    = "item/commandExecution/requestApproval"
 	fileChangeApprovalMethod = "item/fileChange/requestApproval"
+	maxFrameBytes            = 8 * 1024 * 1024
+	// Bounds close if a process outside the group still holds the pipes.
+	killWait = 2 * time.Second
 )
+
+// Time for Codex to stop its own commands after stdin closes; a var so tests can shorten it.
+var closeGrace = 3 * time.Second
 
 func (e *rpcError) Error() string { return fmt.Sprintf("rpc %d: %s", e.Code, e.Message) }
 
@@ -63,6 +70,7 @@ func newClient(binary string, args, env []string, dir string, logger *slog.Logge
 	cmd := exec.Command(binary, append([]string{"app-server"}, args...)...)
 	cmd.Dir = dir
 	cmd.Env = env
+	setProcessGroup(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -102,6 +110,9 @@ func newClient(binary string, args, env []string, dir string, logger *slog.Logge
 			logger.Warn("codex app-server exited", "outcome", "error")
 		default:
 			logger.Debug("codex app-server exited", "outcome", "success")
+		}
+		if err == nil {
+			err = io.ErrUnexpectedEOF
 		}
 		c.fail(fmt.Errorf("codex app-server exited: %w", err))
 		close(c.waitDone)
@@ -179,7 +190,7 @@ func (c *client) fail(err error) {
 }
 func (c *client) read(r io.Reader) {
 	s := bufio.NewScanner(r)
-	s.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	s.Buffer(make([]byte, 64*1024), maxFrameBytes)
 	for s.Scan() {
 		var f frame
 		if err := json.Unmarshal(s.Bytes(), &f); err != nil {
@@ -200,11 +211,6 @@ func (c *client) read(r io.Reader) {
 			c.logger.Warn("codex app-server stream read failed", "error_kind", "read")
 		}
 		c.fail(fmt.Errorf("read app-server: %w", err))
-	} else {
-		if !closing {
-			c.logger.Warn("codex app-server stream ended")
-		}
-		c.fail(fmt.Errorf("codex app-server stream ended unexpectedly: %w", io.ErrUnexpectedEOF))
 	}
 }
 func (c *client) handleFrame(f frame) error {
@@ -309,10 +315,16 @@ func (c *client) close() error {
 		c.mu.Unlock()
 		c.fail(errors.New("codex app-server closed"))
 		_ = c.stdin.Close()
-		if c.cmd.Process != nil {
-			_ = c.cmd.Process.Kill()
+		select {
+		case <-c.waitDone:
+			return
+		case <-time.After(closeGrace):
 		}
-		<-c.waitDone
+		killProcessGroup(c.cmd.Process)
+		select {
+		case <-c.waitDone:
+		case <-time.After(killWait):
+		}
 	})
 	return nil
 }
