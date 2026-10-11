@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +39,9 @@ const (
 var closeGrace = 3 * time.Second
 
 var sensitiveKeyParts = []string{"TOKEN", "KEY", "SECRET", "PASS", "AUTH", "CREDENTIAL"}
+
+// Codex colours its stderr; escape codes make structured logs unreadable.
+var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;?]*[ -/]*[@-~]")
 
 func (e *rpcError) Error() string { return fmt.Sprintf("rpc %d: %s", e.Code, e.Message) }
 
@@ -158,10 +162,14 @@ func drainStderr(r io.Reader, logger *slog.Logger, env []string) {
 			logger.Debug("codex app-server stderr limit reached", "lines", maxLines)
 		}
 		if lines < maxLines {
-			logger.Debug("codex app-server stderr", "line", redactSecrets(string(line), env), "truncated", truncated)
+			logger.Debug("codex app-server stderr", "line", redactSecrets(stripANSI(string(line)), env), "truncated", truncated)
 		}
 		lines++
 	}
+}
+
+func stripANSI(s string) string {
+	return ansiEscape.ReplaceAllString(s, "")
 }
 
 func redactSecrets(line string, env []string) string {
