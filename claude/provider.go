@@ -2,7 +2,6 @@ package claude
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,6 +14,7 @@ import (
 	"sync"
 	"syscall"
 	"unicode/utf8"
+	"uuid"
 
 	hp "github.com/wolfeidau/harness-providers"
 )
@@ -70,14 +70,6 @@ func decodeCursor(c *hp.Cursor) (string, error) {
 		return "", hp.ErrInvalidCursor
 	}
 	return d.SessionID, nil
-}
-
-func newUUID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 // launchKey holds the settings that are fixed for the life of a claude process.
@@ -159,7 +151,7 @@ func (p *Provider) Open(ctx context.Context, in hp.OpenRequest) (hp.Session, err
 		}
 		s.started = true
 	} else {
-		s.sessionID = newUUID()
+		s.sessionID = uuid.NewV4().String()
 	}
 	s.logger.DebugContext(ctx, "claude session opening", "resume", s.started)
 	c, err := s.spawn(ctx, s.key)
@@ -286,7 +278,7 @@ func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, erro
 		s.mu.Unlock()
 		return nil, hp.ErrBusy
 	}
-	t := &turn{s: s, id: newUUID(), admitted: make(chan struct{}), events: make(chan hp.Event, eventBufferSize), pending: make(map[string]pendingRequest), seenText: make(map[string]bool), items: make(map[string]string)}
+	t := &turn{s: s, id: uuid.NewV4().String(), admitted: make(chan struct{}), events: make(chan hp.Event, eventBufferSize), pending: make(map[string]pendingRequest), seenText: make(map[string]bool), items: make(map[string]string)}
 	s.active = t
 	s.early = nil
 	respawn := key != s.key
