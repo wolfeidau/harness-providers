@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -40,6 +41,9 @@ const (
 	fieldBehavior   = "behavior"
 	toolBash        = "Bash"
 	toolAskUser     = "AskUserQuestion"
+	optAccept       = "accept"
+	optDecline      = "decline"
+	optCancel       = "cancel"
 	sandboxSettings = `{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true,"allowUnsandboxedCommands":false}}`
 )
 
@@ -509,13 +513,14 @@ func failureDetail(f frame) string {
 }
 
 type pendingRequest struct {
-	tool  string
-	input json.RawMessage
+	tool      string
+	input     json.RawMessage
+	questions []string // question text by index; Claude keys answers by text
 }
 
 func (s *session) requestEvent(t *turn, f frame) {
 	req := f.Request
-	r := &hp.Request{ID: f.RequestID, Kind: hp.RequestApproval, ItemID: req.ToolUseID, Options: []hp.Option{{ID: "accept", Label: "Accept"}, {ID: "decline", Label: "Decline"}, {ID: "cancel", Label: "Cancel"}}}
+	r := &hp.Request{ID: f.RequestID, Kind: hp.RequestApproval, ItemID: req.ToolUseID, Options: []hp.Option{{ID: optAccept, Label: "Accept"}, {ID: optDecline, Label: "Decline"}, {ID: optCancel, Label: "Cancel"}}}
 	var in struct {
 		Command     string `json:"command"`
 		Description string `json:"description"`
@@ -532,11 +537,13 @@ func (s *session) requestEvent(t *turn, f frame) {
 		} `json:"questions"`
 	}
 	_ = json.Unmarshal(req.Input, &in)
+	pending := pendingRequest{tool: req.ToolName, input: req.Input}
 	switch {
 	case req.ToolName == toolAskUser:
-		r.Kind, r.Options = hp.RequestUserInput, nil
-		for _, q := range in.Questions {
-			question := hp.Question{ID: q.Question, Header: q.Header, Prompt: q.Question, AllowFreeText: true, Multiple: q.MultiSelect}
+		r.Kind, r.Options = hp.RequestUserInput, []hp.Option{{ID: optDecline, Label: "Decline"}, {ID: optCancel, Label: "Cancel"}}
+		for i, q := range in.Questions {
+			pending.questions = append(pending.questions, q.Question)
+			question := hp.Question{ID: "q" + strconv.Itoa(i), Header: q.Header, Prompt: q.Question, AllowFreeText: true, Multiple: q.MultiSelect}
 			for _, o := range q.Options {
 				question.Options = append(question.Options, hp.Option{ID: o.Label, Label: o.Label, Description: o.Description})
 			}
@@ -556,7 +563,7 @@ func (s *session) requestEvent(t *turn, f frame) {
 	default:
 		r.Approval = &hp.Approval{Action: hp.ActionTool, Tool: req.ToolName, Command: string(req.Input), Reason: req.Description}
 	}
-	t.pending[f.RequestID] = pendingRequest{tool: req.ToolName, input: req.Input}
+	t.pending[f.RequestID] = pending
 	s.logger.Debug("claude tool permission request", "session_id", s.sessionID, "turn_id", t.id, "request_id", f.RequestID)
 	s.enqueue(t, hp.Event{Kind: hp.EventRequest, TurnID: t.id, Request: r})
 }
@@ -643,30 +650,31 @@ func (t *turn) takePending(id string, response hp.Response) (map[string]any, err
 		return nil, hp.ErrRequestNotFound
 	}
 	var result map[string]any
-	if p.tool == toolAskUser {
+	switch {
+	case response.OptionID == optDecline:
+		result = map[string]any{fieldBehavior: "deny", "message": "User declined tool execution."}
+	case response.OptionID == optCancel:
+		result = map[string]any{fieldBehavior: "deny", "message": "User canceled tool execution.", "interrupt": true}
+	case p.tool == toolAskUser && response.OptionID == "":
 		input := map[string]any{}
 		if err := json.Unmarshal(p.input, &input); err != nil {
 			return nil, fmt.Errorf("claude decode question input: %w", err)
 		}
 		answers := map[string]string{}
-		for k, v := range response.Answers {
-			if len(v) > 0 {
-				answers[k] = strings.Join(v, ", ")
+		for i, text := range p.questions {
+			if v := response.Answers["q"+strconv.Itoa(i)]; len(v) > 0 {
+				if prev, ok := answers[text]; ok {
+					v = append([]string{prev}, v...)
+				}
+				answers[text] = strings.Join(v, ", ")
 			}
 		}
 		input["answers"] = answers
 		result = map[string]any{fieldBehavior: "allow", "updatedInput": input}
-	} else {
-		switch response.OptionID {
-		case "accept":
-			result = map[string]any{fieldBehavior: "allow", "updatedInput": p.input}
-		case "decline":
-			result = map[string]any{fieldBehavior: "deny", "message": "User declined tool execution."}
-		case "cancel":
-			result = map[string]any{fieldBehavior: "deny", "message": "User canceled tool execution.", "interrupt": true}
-		default:
-			return nil, hp.ErrUnsupported
-		}
+	case p.tool != toolAskUser && response.OptionID == optAccept:
+		result = map[string]any{fieldBehavior: "allow", "updatedInput": p.input}
+	default:
+		return nil, hp.ErrUnsupported
 	}
 	delete(t.pending, id)
 	return result, nil
