@@ -473,7 +473,7 @@ func (s *session) logCompletedItem(t *turn, p eventParams) {
 	if len(output) > outputLimit {
 		output = output[:outputLimit]
 	}
-	s.logger.Debug("codex command failed", "thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "output", redactStderr(output, s.client.cmd.Env))
+	s.logger.Debug("codex command failed", "thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "output", redactSecrets(output, s.client.cmd.Env))
 }
 
 func (s *session) turnFinishedEvent(t *turn, p eventParams) hp.Event {
