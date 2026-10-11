@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -97,6 +98,9 @@ func TestFakePeer(t *testing.T) {
 	}
 	s := bufio.NewScanner(os.Stdin)
 	s.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	if p.scenario == "replay" {
+		p.replay(s, os.Getenv("HARNESS_FAKE_FIXTURE"))
+	}
 	for s.Scan() {
 		appendLine(os.Getenv("HARNESS_FAKE_RECVLOG"), s.Text())
 		var f peerFrame
@@ -247,6 +251,106 @@ func (p *peerState) interrupt(f peerFrame) {
 		p.write(map[string]any{"type": "user", "message": map[string]any{"content": []any{block}}})
 		p.result(map[string]any{"terminal_reason": "aborted_tools", "stop_reason": "tool_use"})
 	}
+}
+
+var fixtureSessionID = regexp.MustCompile(`"session_id":"([0-9a-f-]{36})"`)
+
+func (p *peerState) die(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "replay: "+format+"\n", args...)
+	os.Exit(2)
+}
+
+// expect blocks for the adapter's next frame and requires it to match want's type and subtype.
+func (p *peerState) expect(s *bufio.Scanner, want peerFrame) peerFrame {
+	if !s.Scan() {
+		p.die("stdin closed while waiting for %s", want.Type)
+	}
+	appendLine(os.Getenv("HARNESS_FAKE_RECVLOG"), s.Text())
+	var got peerFrame
+	if json.Unmarshal(s.Bytes(), &got) != nil {
+		p.die("undecodable frame %q", s.Text())
+	}
+	subtype := func(f peerFrame) string {
+		if f.Request == nil {
+			return ""
+		}
+		return f.Request.Subtype
+	}
+	if got.Type != want.Type || subtype(got) != subtype(want) {
+		p.die("got %s/%s, want %s/%s", got.Type, subtype(got), want.Type, subtype(want))
+	}
+	return got
+}
+
+// replay plays a captured fixture back: `>>` lines wait for the adapter's matching frame, except a
+// control_response after an interrupt (the adapter drops pending requests); `<<` lines are emitted
+// with the capture's session, user and request IDs rewritten to the adapter's.
+func (p *peerState) replay(s *bufio.Scanner, path string) {
+	raw, err := os.ReadFile(path) //nolint:gosec // Test-controlled path.
+	if err != nil {
+		p.die("%v", err)
+	}
+	fixtureSID := ""
+	if m := fixtureSessionID.FindSubmatch(raw); m != nil {
+		fixtureSID = string(m[1])
+	}
+	rewrite := map[string]string{}
+	interrupted := false
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		switch {
+		case strings.HasPrefix(line, ">> "):
+			var want peerFrame
+			if json.Unmarshal([]byte(line[3:]), &want) != nil {
+				p.die("bad fixture line %q", line)
+			}
+			if want.Type == "control_response" && interrupted {
+				continue
+			}
+			got := p.expect(s, want)
+			switch want.Type {
+			case "user":
+				rewrite[want.UUID] = got.UUID
+			case "control_request":
+				rewrite[want.RequestID] = got.RequestID
+				interrupted = interrupted || want.Request.Subtype == "interrupt"
+			}
+		case strings.HasPrefix(line, "<< "):
+			p.emit(line[3:], fixtureSID, rewrite)
+		case strings.HasPrefix(line, "## exit="):
+			p.exit(s, line, fixtureSID)
+		}
+	}
+	p.die("fixture has no exit line")
+}
+
+func (p *peerState) emit(out, fixtureSID string, rewrite map[string]string) {
+	if fixtureSID != "" {
+		out = strings.ReplaceAll(out, fixtureSID, p.sid)
+	}
+	for from, to := range rewrite {
+		out = strings.ReplaceAll(out, `"`+from+`"`, `"`+to+`"`)
+	}
+	if _, err := fmt.Fprintln(p.w, out); err != nil {
+		os.Exit(2)
+	}
+	if err := p.w.Flush(); err != nil {
+		os.Exit(2)
+	}
+}
+
+func (p *peerState) exit(s *bufio.Scanner, line, fixtureSID string) {
+	code, stderr, _ := strings.Cut(strings.TrimPrefix(line, "## exit="), " stderr=")
+	n, err := strconv.Atoi(code)
+	if err != nil {
+		p.die("bad exit line %q", line)
+	}
+	if stderr == "" {
+		for s.Scan() { // a clean capture ends at stdin EOF, which is how Close signals shutdown
+			appendLine(os.Getenv("HARNESS_FAKE_RECVLOG"), s.Text())
+		}
+	}
+	fmt.Fprintln(os.Stderr, strings.ReplaceAll(stderr, fixtureSID, p.sid))
+	os.Exit(n)
 }
 
 type peerLogs struct{ argv, recv string }
@@ -816,4 +920,163 @@ func TestCloseKillsProcessGroupAndDoesNotHang(t *testing.T) {
 		t.Fatal("Close did not return")
 	}
 	require.Eventually(t, func() bool { return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) }, 2*time.Second, 10*time.Millisecond)
+}
+
+func replayFixture(t *testing.T, name string, resume *hp.Cursor) (hp.Session, peerLogs, error) {
+	t.Helper()
+	path, err := filepath.Abs(filepath.Join("testdata", name+".ndjson"))
+	require.NoError(t, err)
+	p, logs := fakeProvider(t, "replay", "HARNESS_FAKE_FIXTURE="+path)
+	s, err := p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir(), Resume: resume})
+	if err != nil {
+		return nil, logs, err
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close replay session: %v", err)
+		}
+	})
+	return s, logs, nil
+}
+
+func replayTurn(t *testing.T, name string, sandbox hp.SandboxMode) (hp.Turn, peerLogs) {
+	t.Helper()
+	s, logs, err := replayFixture(t, name, nil)
+	require.NoError(t, err)
+	in := textInput("hello")
+	in.Policy.Sandbox = sandbox
+	turn, err := s.StartTurn(contextForTest(t), in)
+	require.NoError(t, err)
+	return turn, logs
+}
+
+func nextRequest(t *testing.T, turn hp.Turn) *hp.Request {
+	t.Helper()
+	for {
+		if e := next(t, turn); e.Kind == hp.EventRequest {
+			return e.Request
+		}
+	}
+}
+
+func joinText(events []hp.Event) string {
+	var b strings.Builder
+	for _, e := range events {
+		if e.Kind == hp.EventTextDelta {
+			b.WriteString(e.Text)
+		}
+	}
+	return b.String()
+}
+
+func finishedItems(events []hp.Event) []*hp.Item {
+	var out []*hp.Item
+	for _, e := range events {
+		if e.Kind == hp.EventItemFinished {
+			out = append(out, e.Item)
+		}
+	}
+	return out
+}
+
+func TestReplayFixtures(t *testing.T) {
+	t.Run("simple", func(t *testing.T) {
+		turn, _ := replayTurn(t, "simple", hp.SandboxDefault)
+		events := collect(t, turn)
+		assert.Equal(t, hp.EventTurnStarted, events[0].Kind)
+		assert.Equal(t, "pong", joinText(events))
+		var usage *hp.Usage
+		for _, e := range events {
+			if e.Kind == hp.EventUsage {
+				usage = e.Usage
+			}
+		}
+		require.NotNil(t, usage)
+		assert.NotZero(t, usage.InputTokens)
+		assert.NotZero(t, usage.OutputTokens)
+		assert.Equal(t, hp.OutcomeCompleted, events[len(events)-1].Outcome.Status)
+		_, err := turn.Next(contextForTest(t))
+		require.ErrorIs(t, err, io.EOF)
+	})
+
+	t.Run("deny", func(t *testing.T) {
+		turn, _ := replayTurn(t, "deny", hp.SandboxDefault)
+		req := nextRequest(t, turn)
+		require.NotNil(t, req.Approval)
+		assert.Equal(t, hp.ActionCommand, req.Approval.Action)
+		assert.Equal(t, "touch approved.txt", req.Approval.Command)
+		assert.NotEmpty(t, req.ItemID)
+		require.NoError(t, turn.Respond(contextForTest(t), req.ID, hp.Response{OptionID: "decline"}))
+		events := collect(t, turn)
+		items := finishedItems(events)
+		require.Len(t, items, 1)
+		assert.Equal(t, hp.ItemDeclined, items[0].Status)
+		assert.Equal(t, hp.OutcomeCompleted, events[len(events)-1].Outcome.Status)
+	})
+
+	t.Run("interrupt", func(t *testing.T) {
+		turn, _ := replayTurn(t, "interrupt", hp.SandboxDefault)
+		req := nextRequest(t, turn)
+		require.NoError(t, turn.Interrupt(contextForTest(t)))
+		events := collect(t, turn)
+		require.ErrorIs(t, turn.Respond(contextForTest(t), req.ID, hp.Response{OptionID: "accept"}), hp.ErrRequestNotFound)
+		assert.Equal(t, hp.OutcomeInterrupted, events[len(events)-1].Outcome.Status)
+	})
+
+	t.Run("ask_user_question", func(t *testing.T) {
+		turn, logs := replayTurn(t, "ask_user_question", hp.SandboxDefault)
+		req := nextRequest(t, turn)
+		assert.Equal(t, hp.RequestUserInput, req.Kind)
+		require.Len(t, req.Questions, 1)
+		q := req.Questions[0]
+		assert.Equal(t, "Which colour do you prefer?", q.ID)
+		labels := make([]string, len(q.Options))
+		for i, o := range q.Options {
+			labels[i] = o.Label
+		}
+		assert.Equal(t, []string{"Red", "Blue"}, labels)
+		require.NoError(t, turn.Respond(contextForTest(t), req.ID, hp.Response{Answers: map[string][]string{q.ID: {"Blue"}}}))
+		sent := logs.received(t, func(m map[string]any) bool { return m["type"] == "control_response" })
+		payload := sent["response"].(map[string]any)["response"].(map[string]any)
+		answers := payload["updatedInput"].(map[string]any)["answers"].(map[string]any)
+		assert.Equal(t, "Blue", answers[q.ID])
+		events := collect(t, turn)
+		assert.Contains(t, joinText(events), "Blue")
+		assert.Equal(t, hp.OutcomeCompleted, events[len(events)-1].Outcome.Status)
+	})
+
+	t.Run("read_only", func(t *testing.T) {
+		turn, _ := replayTurn(t, "read_only", hp.SandboxReadOnly)
+		events := collect(t, turn)
+		for _, e := range events {
+			assert.NotEqual(t, hp.EventRequest, e.Kind)
+		}
+		items := finishedItems(events)
+		require.Len(t, items, 1)
+		assert.Equal(t, hp.ItemFailed, items[0].Status)
+		assert.Equal(t, hp.OutcomeCompleted, events[len(events)-1].Outcome.Status)
+	})
+
+	t.Run("workspace_write", func(t *testing.T) {
+		turn, _ := replayTurn(t, "workspace_write", hp.SandboxWorkspaceWrite)
+		events := collect(t, turn)
+		items := finishedItems(events)
+		require.Len(t, items, 2)
+		assert.Equal(t, hp.ItemCompleted, items[0].Status)
+		assert.Equal(t, hp.ItemFailed, items[1].Status)
+		var labels []string
+		for _, e := range events {
+			if e.Kind == hp.EventItemStarted {
+				labels = append(labels, e.Item.Label)
+			}
+		}
+		assert.Equal(t, []string{"touch inside.txt", "touch ../outside.txt"}, labels)
+		assert.Equal(t, hp.OutcomeCompleted, events[len(events)-1].Outcome.Status)
+	})
+
+	t.Run("missing_session", func(t *testing.T) {
+		cursor := &hp.Cursor{Provider: "claude", Version: 1, Data: json.RawMessage(`{"sessionId":"s-1"}`)}
+		_, _, err := replayFixture(t, "missing_session", cursor)
+		require.ErrorIs(t, err, hp.ErrSessionNotFound)
+	})
 }
