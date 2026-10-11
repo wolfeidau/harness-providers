@@ -79,7 +79,7 @@ provider := claude.New(claude.Config{ConfigDir: "/path/to/claude-config"})
 
 `Config.ConfigDir` sets `CLAUDE_CONFIG_DIR` for the child; if omitted, the child inherits the ambient environment. The cursor contains the Claude session ID; resume needs the same config directory and workspace. A session closed before its first turn has nothing to resume and returns `ErrSessionNotFound`.
 
-Claude Code has no per-turn sandbox, so `ExecutionPolicy` maps to launch flags: `read_only` limits tools to Read, Glob and Grep; `workspace_write` uses accept-edits mode with Claude's Bash sandbox; `ApprovalNever` with `unrestricted` bypasses permissions. A turn whose model, effort or policy differs from the previous one restarts the CLI with `--resume`. Approvals for tools other than shell commands and file edits arrive with `Approval.Action` set to `tool`.
+Claude Code has no per-turn sandbox, so `ExecutionPolicy` maps to launch flags: `read_only` limits tools to Read, Glob and Grep and ignores the workspace's own `.claude` settings (whose hooks could otherwise run commands); `workspace_write` uses accept-edits mode with Claude's Bash sandbox; `ApprovalNever` with `unrestricted` bypasses permissions. Modes other than `read_only` load the workspace's project settings, so use them only on trusted workspaces. A turn whose model, effort or policy differs from the previous one restarts the CLI with `--resume`. Approvals for tools other than shell commands and file edits arrive with `Approval.Action` set to `tool`.
 
 ## Tests
 
