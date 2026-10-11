@@ -486,3 +486,23 @@ func TestCloseKillsProcessGroupAndDoesNotHang(t *testing.T) {
 	}
 	require.Eventually(t, func() bool { return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) }, 2*time.Second, 10*time.Millisecond)
 }
+
+func TestRedactSecrets(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+		line string
+		want string
+	}{
+		{name: "token redacted", env: "GITHUB_TOKEN=s3cr3tvalue", line: "auth s3cr3tvalue", want: "auth [REDACTED]"},
+		{name: "auth redacted", env: "MY_AUTH=abcdefgh", line: "x abcdefgh", want: "x [REDACTED]"},
+		{name: "credential redacted", env: "DB_CREDENTIAL=hunter22", line: "x hunter22", want: "x [REDACTED]"},
+		{name: "non sensitive kept", env: "PATH=/usr/bin:/bin", line: "x /usr/bin:/bin", want: "x /usr/bin:/bin"},
+		{name: "short value kept", env: "API_KEY=abc", line: "x abc", want: "x abc"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, redactSecrets(tt.line, []string{tt.env}))
+		})
+	}
+}
