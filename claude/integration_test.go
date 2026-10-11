@@ -129,7 +129,7 @@ func TestClaudeApprovalE2E(t *testing.T) {
 			t.Logf("approval: %+v", *a)
 			require.Equal(t, hp.ActionCommand, a.Action)
 			require.Contains(t, a.Command, "touch approved.txt")
-			require.NotEmpty(t, a.Cwd)
+			require.Equal(t, workspace, a.Cwd)
 			require.NoError(t, turn.Respond(ctx, e.Request.ID, hp.Response{OptionID: "decline"}))
 			declined = true
 		case e.Kind == hp.EventRequest:

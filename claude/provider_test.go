@@ -703,6 +703,7 @@ func TestAskUserQuestionCancel(t *testing.T) {
 	turn := startFake(t, s)
 	req := nextRequest(t, turn)
 	require.ErrorIs(t, turn.Respond(contextForTest(t), req.ID, hp.Response{Answers: map[string][]string{"Which colour?": {"Red"}}}), hp.ErrUnsupported)
+	require.ErrorIs(t, turn.Respond(contextForTest(t), req.ID, hp.Response{Answers: map[string][]string{"q0": nil}}), hp.ErrUnsupported)
 	require.NoError(t, turn.Respond(contextForTest(t), req.ID, hp.Response{OptionID: "cancel"}))
 	sent := logs.received(t, func(m map[string]any) bool { return m["type"] == "control_response" })
 	payload := sent["response"].(map[string]any)["response"].(map[string]any)
