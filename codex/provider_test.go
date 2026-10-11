@@ -269,11 +269,27 @@ func TestExitAndResumeErrors(t *testing.T) {
 	require.Error(t, err)
 	require.NotErrorIs(t, err, io.EOF)
 	require.ErrorContains(t, err, "exit status 3")
+	require.NotErrorIs(t, err, hp.ErrClosed)
+	_, err = s.StartTurn(contextForTest(t), hp.TurnInput{Parts: []hp.InputPart{{Kind: hp.InputText, Text: "again"}}})
+	require.ErrorIs(t, err, hp.ErrClosed)
+	require.NotErrorIs(t, err, hp.ErrBusy)
 	p := fakeProvider(t, "missing")
 	_, err = p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir(), Resume: &hp.Cursor{Provider: "codex", Version: 1, Data: json.RawMessage(`{"threadId":"thread-1"}`)}})
 	require.ErrorIs(t, err, hp.ErrSessionNotFound)
 	_, err = p.Open(contextForTest(t), hp.OpenRequest{WorkingDirectory: t.TempDir(), Resume: &hp.Cursor{Provider: "claude", Version: 1, Data: json.RawMessage(`{}`)}})
 	require.ErrorIs(t, err, hp.ErrInvalidCursor)
+}
+
+func TestClosedSessionReturnsErrClosed(t *testing.T) {
+	s := openFake(t, "approval")
+	turn := startFake(t, s)
+	e := next(t, turn)
+	require.Equal(t, hp.EventRequest, e.Kind)
+	require.NoError(t, s.Close())
+	_, err := turn.Next(contextForTest(t))
+	require.ErrorIs(t, err, hp.ErrClosed)
+	require.ErrorIs(t, turn.Respond(contextForTest(t), e.Request.ID, hp.Response{OptionID: "decline"}), hp.ErrClosed)
+	require.ErrorIs(t, turn.Interrupt(contextForTest(t)), hp.ErrClosed)
 }
 
 func TestUncertainStartClosesSession(t *testing.T) {
@@ -380,17 +396,6 @@ func TestDebugLogsLifecycleWithoutContent(t *testing.T) {
 	}
 }
 
-func TestStderrDebugLogIsBoundedAndRedacted(t *testing.T) {
-	var logs lockedBuffer
-	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	drainStderr(strings.NewReader("error: SECRET_TOKEN_VALUE\n"+strings.Repeat("x", 5000)+"\n"), logger, []string{"ACCESS_TOKEN=SECRET_TOKEN_VALUE"})
-	got := logs.String()
-	assert.Contains(t, got, "error: [REDACTED]")
-	assert.Contains(t, got, `"truncated":true`)
-	assert.NotContains(t, got, "SECRET_TOKEN_VALUE")
-	assert.NotContains(t, got, strings.Repeat("x", 5000))
-}
-
 func TestDebugLogsFailedCommandOutcome(t *testing.T) {
 	var logs lockedBuffer
 	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -486,42 +491,4 @@ func TestCloseKillsProcessGroupAndDoesNotHang(t *testing.T) {
 		t.Fatal("Close did not return")
 	}
 	require.Eventually(t, func() bool { return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) }, 2*time.Second, 10*time.Millisecond)
-}
-
-func TestRedactSecrets(t *testing.T) {
-	tests := []struct {
-		name string
-		env  string
-		line string
-		want string
-	}{
-		{name: "token redacted", env: "GITHUB_TOKEN=s3cr3tvalue", line: "auth s3cr3tvalue", want: "auth [REDACTED]"},
-		{name: "auth redacted", env: "MY_AUTH=abcdefgh", line: "x abcdefgh", want: "x [REDACTED]"},
-		{name: "credential redacted", env: "DB_CREDENTIAL=hunter22", line: "x hunter22", want: "x [REDACTED]"},
-		{name: "non sensitive kept", env: "PATH=/usr/bin:/bin", line: "x /usr/bin:/bin", want: "x /usr/bin:/bin"},
-		{name: "short value kept", env: "API_KEY=abc", line: "x abc", want: "x abc"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, redactSecrets(tt.line, []string{tt.env}))
-		})
-	}
-}
-
-func TestStripANSI(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{name: "codex log line", in: "\x1b[2m2026-10-11T02:46:13Z\x1b[0m \x1b[31mERROR\x1b[0m failed", want: "2026-10-11T02:46:13Z ERROR failed"},
-		{name: "plain text kept", in: "x /usr/bin:/bin", want: "x /usr/bin:/bin"},
-		{name: "empty", in: "", want: ""},
-		{name: "multi param", in: "\x1b[1;31mred\x1b[0m", want: "red"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, stripANSI(tt.in))
-		})
-	}
 }

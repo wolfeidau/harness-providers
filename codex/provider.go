@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	hp "github.com/wolfeidau/harness-providers"
+	"github.com/wolfeidau/harness-providers/internal/subprocess"
 )
 
 type Config struct {
@@ -172,6 +173,12 @@ func (s *session) Close() error {
 	return s.client.close()
 }
 
+func (s *session) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
 func validateInput(in hp.TurnInput) ([]map[string]any, error) {
 	if len(in.Parts) == 0 {
 		return nil, hp.ErrUnsupported
@@ -226,6 +233,11 @@ func (s *session) StartTurn(ctx context.Context, in hp.TurnInput) (hp.Turn, erro
 	if s.closed {
 		s.mu.Unlock()
 		return nil, hp.ErrClosed
+	}
+	// The child is never respawned, so a failed client means a dead session.
+	if err = s.client.failure(); err != nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("codex app-server failed: %w: %w", hp.ErrClosed, err)
 	}
 	if s.active != nil {
 		s.mu.Unlock()
@@ -473,7 +485,7 @@ func (s *session) logCompletedItem(t *turn, p eventParams) {
 	if len(output) > outputLimit {
 		output = output[:outputLimit]
 	}
-	s.logger.Debug("codex command failed", "thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "output", redactSecrets(stripANSI(output), s.client.cmd.Env))
+	s.logger.Debug("codex command failed", "thread_id", s.threadID, "turn_id", t.id, "item_id", p.Item.ID, "output", subprocess.RedactSecrets(subprocess.StripANSI(output), s.client.cmd.Env))
 }
 
 func (s *session) turnFinishedEvent(t *turn, p eventParams) hp.Event {
@@ -600,6 +612,9 @@ func (t *turn) Respond(ctx context.Context, id string, response hp.Response) err
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if t.s.isClosed() {
+		return hp.ErrClosed
+	}
 	p, result, err := t.takePending(id, response)
 	if err != nil {
 		return err
@@ -641,6 +656,9 @@ func (t *turn) takePending(id string, response hp.Response) (pendingRequest, any
 }
 
 func (t *turn) Interrupt(ctx context.Context) error {
+	if t.s.isClosed() {
+		return hp.ErrClosed
+	}
 	t.s.mu.Lock()
 	active := t.s.active == t
 	threadID := t.s.threadID

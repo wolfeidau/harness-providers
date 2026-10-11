@@ -4,17 +4,18 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	hp "github.com/wolfeidau/harness-providers"
+	"github.com/wolfeidau/harness-providers/internal/subprocess"
 )
 
 type rpcError struct {
@@ -37,11 +38,6 @@ const (
 
 // Time for Codex to stop its own commands after stdin closes; a var so tests can shorten it.
 var closeGrace = 3 * time.Second
-
-var sensitiveKeyParts = []string{"TOKEN", "KEY", "SECRET", "PASS", "AUTH", "CREDENTIAL"}
-
-// Codex colours its stderr; escape codes make structured logs unreadable.
-var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;?]*[ -/]*[@-~]")
 
 func (e *rpcError) Error() string { return fmt.Sprintf("rpc %d: %s", e.Code, e.Message) }
 
@@ -80,7 +76,7 @@ func newClient(binary string, args, env []string, dir string, logger *slog.Logge
 	cmd := exec.Command(binary, append([]string{"app-server"}, args...)...)
 	cmd.Dir = dir
 	cmd.Env = env
-	setProcessGroup(cmd)
+	subprocess.SetProcessGroup(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("codex stdin pipe: %w", err)
@@ -100,7 +96,7 @@ func newClient(binary string, args, env []string, dir string, logger *slog.Logge
 	c := &client{cmd: cmd, logger: logger, stdin: stdin, waiting: make(map[string]chan reply), onMessage: onMessage, done: make(chan struct{}), waitDone: make(chan struct{})}
 	stderrDone := make(chan struct{})
 	go func() {
-		drainStderr(stderr, logger, env)
+		subprocess.DrainStderr(stderr, logger, "codex app-server", env)
 		close(stderrDone)
 	}()
 	readDone := make(chan struct{})
@@ -129,66 +125,6 @@ func newClient(binary string, args, env []string, dir string, logger *slog.Logge
 	return c, nil
 }
 
-func drainStderr(r io.Reader, logger *slog.Logger, env []string) {
-	const maxLines = 100
-	const maxLineBytes = 4096
-	reader := bufio.NewReader(r)
-	lines := 0
-	for {
-		var line []byte
-		truncated := false
-		for {
-			part, prefix, err := reader.ReadLine()
-			if err != nil {
-				if err != io.EOF {
-					logger.Debug("codex app-server stderr read failed", "error_kind", failureKind(err))
-				}
-				return
-			}
-			if lines < maxLines {
-				remaining := maxLineBytes - len(line)
-				if len(part) > remaining {
-					line = append(line, part[:remaining]...)
-					truncated = true
-				} else {
-					line = append(line, part...)
-				}
-			}
-			if !prefix {
-				break
-			}
-		}
-		if lines == maxLines {
-			logger.Debug("codex app-server stderr limit reached", "lines", maxLines)
-		}
-		if lines < maxLines {
-			logger.Debug("codex app-server stderr", "line", redactSecrets(stripANSI(string(line)), env), "truncated", truncated)
-		}
-		lines++
-	}
-}
-
-func stripANSI(s string) string {
-	return ansiEscape.ReplaceAllString(s, "")
-}
-
-func redactSecrets(line string, env []string) string {
-	for _, entry := range env {
-		key, value, ok := strings.Cut(entry, "=")
-		if !ok || len(value) < 4 {
-			continue
-		}
-		key = strings.ToUpper(key)
-		for _, part := range sensitiveKeyParts {
-			if strings.Contains(key, part) {
-				line = strings.ReplaceAll(line, value, "[REDACTED]")
-				break
-			}
-		}
-	}
-	return line
-}
-
 func (c *client) fail(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -196,7 +132,7 @@ func (c *client) fail(err error) {
 		return
 	}
 	if !c.closing {
-		c.logger.Warn("codex app-server failed", "error_kind", failureKind(err))
+		c.logger.Warn("codex app-server failed", "error_kind", subprocess.FailureKind(err))
 	}
 	c.err = err
 	for id, ch := range c.waiting {
@@ -335,31 +271,20 @@ func (c *client) close() error {
 		c.mu.Lock()
 		c.closing = true
 		c.mu.Unlock()
-		c.fail(errors.New("codex app-server closed"))
+		c.fail(fmt.Errorf("codex app-server closed: %w", hp.ErrClosed))
 		_ = c.stdin.Close()
 		select {
 		case <-c.waitDone:
 		case <-time.After(closeGrace):
 		}
 		// Commands Codex spawned may outlive it; killing an empty group is harmless.
-		killProcessGroup(c.cmd.Process)
+		subprocess.KillProcessGroup(c.cmd.Process)
 		select {
 		case <-c.waitDone:
 		case <-time.After(killWait):
 		}
 	})
 	return nil
-}
-
-func failureKind(err error) string {
-	switch {
-	case errors.Is(err, io.ErrUnexpectedEOF):
-		return "unexpected_eof"
-	case errors.Is(err, io.EOF):
-		return "eof"
-	default:
-		return "other"
-	}
 }
 
 func (c *client) failure() error {

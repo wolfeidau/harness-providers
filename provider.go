@@ -166,6 +166,7 @@ type Approval struct {
 	Reason    string
 	Host      string // network host requested, if any
 	Protocol  string // network protocol requested, if any
+	Tool      string // harness tool name when Action is tool
 }
 
 type ActionKind string
@@ -174,6 +175,7 @@ const (
 	ActionCommand    ActionKind = "command"
 	ActionFileChange ActionKind = "file_change"
 	ActionWriteStdin ActionKind = "write_stdin"
+	ActionTool       ActionKind = "tool"
 )
 
 type RequestKind string
