@@ -9,7 +9,7 @@ The contract covers starting or resuming a native conversation, running one turn
 | Provider | Package | Status |
 |---|---|---|
 | Codex (`codex app-server`) | `codex` | Implemented |
-| Claude Code (`claude -p` stream-json) | `claude` | Planned |
+| Claude Code (`claude -p` stream-json) | `claude` | Implemented |
 
 ## Public contract
 
@@ -66,7 +66,7 @@ HARNESS_TEST_CODEX_HOME=/path/to/test-codex-home HARNESS_LIVE_TEST=1 \
   go test -tags=integration ./codex/... -run 'E2E$' -count=1 -timeout=3m
 ```
 
-## Claude Code provider (planned)
+## Claude Code provider (implemented)
 
 Drives the `claude` CLI directly over its stream-json stdio protocol, the same protocol the Claude Agent SDK uses internally. The [T3 Claude adapter](https://github.com/pingdotgg/t3code) (`ClaudeAdapterV2.ts`) is the reference integration. Frame shapes below were captured from `claude` 2.1.296; sanitized captures live in `claude/testdata/` (`>>` lines are sent, `<<` lines received).
 
@@ -107,7 +107,12 @@ Drives the `claude` CLI directly over its stream-json stdio protocol, the same p
 
 ### Verification
 
-Deterministic tests mirror the Codex suite with a fake `claude` peer replaying the `claude/testdata` frames, plus the policy-to-flags table and respawn on settings change. Live tests use the same tag and opt-in, `claude-haiku-5-5` at `low` effort, and credentials from `HARNESS_TEST_CLAUDE_CONFIG_DIR` or `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` with a temporary config directory; the default `~/.claude` is never used. `TestClaudeReviewE2E` and `TestClaudeApprovalE2E` match the Codex scenarios.
+Deterministic tests mirror the Codex suite with a fake `claude` peer replaying the `claude/testdata` frames, plus the policy-to-flags table and respawn on settings change. Live tests use the same tag and opt-in, `claude-haiku-5-5` at `low` effort, and credentials from `HARNESS_TEST_CLAUDE_CONFIG_DIR` or `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` with a temporary config directory; the default `~/.claude` is never used. `TestClaudeReviewE2E` and `TestClaudeApprovalE2E` match the Codex scenarios; the review resume also exercises a policy respawn with `--resume`.
+
+```sh
+HARNESS_TEST_CLAUDE_CONFIG_DIR=/path/to/test-claude-config HARNESS_LIVE_TEST=1 \
+  go test -tags=integration ./claude/... -run 'E2E$' -count=1 -timeout=3m
+```
 
 ## Extension rules
 
