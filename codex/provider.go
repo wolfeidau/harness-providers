@@ -29,6 +29,7 @@ type Provider struct{ config Config }
 
 const (
 	providerName        = "codex"
+	optCancel           = "cancel"
 	itemTypeField       = "type"
 	itemCompletedMethod = "item/completed"
 	clientVersion       = "0.1.0"
@@ -515,7 +516,7 @@ func (s *session) requestEvent(t *turn, p eventParams, f frame) (hp.Event, bool)
 	if f.Method == requestUserInputMethod {
 		kind = hp.RequestUserInput
 	}
-	r := &hp.Request{ID: rid, Kind: kind, ItemID: p.ItemID, Options: []hp.Option{{ID: "accept", Label: "Accept"}, {ID: "decline", Label: "Decline"}, {ID: "cancel", Label: "Cancel"}}}
+	r := &hp.Request{ID: rid, Kind: kind, ItemID: p.ItemID, Options: []hp.Option{{ID: "accept", Label: "Accept"}, {ID: "decline", Label: "Decline"}, {ID: optCancel, Label: "Cancel"}}}
 	switch f.Method {
 	case commandApprovalMethod:
 		r.Approval = &hp.Approval{Action: action, Command: p.Command, Cwd: p.Cwd, Reason: p.Reason}
@@ -525,9 +526,13 @@ func (s *session) requestEvent(t *turn, p eventParams, f frame) (hp.Event, bool)
 	case fileChangeApprovalMethod:
 		r.Approval = &hp.Approval{Action: hp.ActionFileChange, Paths: t.filePaths[p.ItemID], WriteRoot: p.GrantRoot, Reason: p.Reason}
 	}
+	pending := pendingRequest{id: f.ID, method: f.Method}
 	if kind == hp.RequestUserInput {
-		r.Options = nil
+		// The protocol has no decline; cancel answers nothing and interrupts the turn.
+		r.Options = []hp.Option{{ID: optCancel, Label: "Cancel"}}
+		pending.questions = map[string]bool{}
 		for _, q := range p.Questions {
+			pending.questions[q.ID] = true
 			question := hp.Question{ID: q.ID, Header: q.Header, Prompt: q.Question, AllowFreeText: true}
 			for _, o := range q.Options {
 				question.Options = append(question.Options, hp.Option{ID: o.Label, Label: o.Label, Description: o.Description})
@@ -535,7 +540,7 @@ func (s *session) requestEvent(t *turn, p eventParams, f frame) (hp.Event, bool)
 			r.Questions = append(r.Questions, question)
 		}
 	}
-	t.pending[rid] = pendingRequest{id: f.ID, method: f.Method}
+	t.pending[rid] = pending
 	s.logger.Debug("codex server request", "thread_id", s.threadID, "turn_id", t.id, "request_id", rid, "method", f.Method)
 	return hp.Event{Kind: hp.EventRequest, TurnID: t.id, Request: r}, true
 }
@@ -560,8 +565,9 @@ func (s *session) enqueue(t *turn, e hp.Event) {
 }
 
 type pendingRequest struct {
-	id     json.RawMessage
-	method string
+	id        json.RawMessage
+	method    string
+	questions map[string]bool // question IDs for requestUserInput
 }
 
 type turn struct {
@@ -623,6 +629,9 @@ func (t *turn) Respond(ctx context.Context, id string, response hp.Response) err
 		return fmt.Errorf("codex respond to request %s: %w", id, err)
 	}
 	t.s.logger.DebugContext(ctx, "codex server request answered", "thread_id", t.s.threadID, "turn_id", t.id, "request_id", id, "method", p.method)
+	if p.method == requestUserInputMethod && response.OptionID == optCancel {
+		return t.Interrupt(ctx)
+	}
 	return nil
 }
 
@@ -638,14 +647,23 @@ func (t *turn) takePending(id string, response hp.Response) (pendingRequest, any
 	if p.method == requestUserInputMethod {
 		answers := map[string]any{}
 		for k, v := range response.Answers {
+			if !p.questions[k] {
+				return pendingRequest{}, nil, fmt.Errorf("codex unknown question %q: %w", k, hp.ErrUnsupported)
+			}
 			if len(v) > 0 {
 				answers[k] = map[string]any{"answers": v}
 			}
 		}
+		switch {
+		case response.OptionID == optCancel:
+			answers = map[string]any{}
+		case response.OptionID != "" || len(answers) == 0:
+			return pendingRequest{}, nil, hp.ErrUnsupported
+		}
 		result = map[string]any{"answers": answers}
 	} else {
 		switch response.OptionID {
-		case "accept", "decline", "cancel":
+		case "accept", "decline", optCancel:
 		default:
 			return pendingRequest{}, nil, hp.ErrUnsupported
 		}

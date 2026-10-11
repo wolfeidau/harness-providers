@@ -694,6 +694,9 @@ func (p pendingRequest) answered(response map[string][]string) (map[string]any, 
 	if used != len(response) {
 		return nil, fmt.Errorf("claude answers name unknown question IDs: %w", hp.ErrUnsupported)
 	}
+	if len(answers) == 0 {
+		return nil, fmt.Errorf("claude answers are empty: %w", hp.ErrUnsupported)
+	}
 	input["answers"] = answers
 	return input, nil
 }

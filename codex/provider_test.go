@@ -55,15 +55,24 @@ func TestFakePeer(t *testing.T) {
 			write(map[string]any{"id": f.ID, "result": map[string]any{}})
 			write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "interrupted"}}})
 		default:
-			if len(f.ID) > 0 && f.Method == "" {
-				if scenario == "unknown_request" && (f.Error == nil || f.Error.Code != -32601) {
-					os.Exit(4)
-				}
-				write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
-			}
+			fakeResponse(write, f, scenario)
 		}
 	}
 	fakeExit(scenario)
+}
+
+// fakeResponse completes the turn once the adapter answers a server request.
+func fakeResponse(write func(any), f frame, scenario string) {
+	if len(f.ID) == 0 || f.Method != "" {
+		return
+	}
+	if scenario == "unknown_request" && (f.Error == nil || f.Error.Code != -32601) {
+		os.Exit(4)
+	}
+	if scenario == "user_input" {
+		return // only turn/interrupt may end the turn
+	}
+	write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}}})
 }
 
 func fakeExit(scenario string) {
@@ -126,6 +135,9 @@ func fakeTurnStart(write func(any), f frame, scenario string) {
 		write(map[string]any{"id": 82, "method": "item/tool/requestUserInput", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "tool-1", "questions": []any{map[string]any{"id": "q1", "header": "Pick", "question": "Which?", "options": []any{map[string]any{"label": "A", "description": "first"}}}}}})
 		write(map[string]any{"id": 83, "method": "item/commandExecution/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "cmd-2", "kind": "writeStdin", "networkApprovalContext": map[string]any{"host": "example.com", "protocol": "https"}}})
 		write(map[string]any{"id": 84, "method": "item/commandExecution/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "cmd-3", "kind": "future"}})
+	}
+	if scenario == "user_input" {
+		write(map[string]any{"id": 85, "method": "item/tool/requestUserInput", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1", "itemId": "tool-1", "questions": []any{map[string]any{"id": "q1", "header": "Pick", "question": "Which?"}}}})
 	}
 	if scenario == "unknown_request" {
 		write(map[string]any{"id": 78, "method": "item/unknown/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "turn-1"}})
@@ -262,6 +274,21 @@ func TestStructuredRequests(t *testing.T) {
 		assert.NotEqual(t, hp.EventRequest, e.Kind)
 	}
 }
+func TestUserInputValidationAndCancel(t *testing.T) {
+	turn := startFake(t, openFake(t, "user_input"))
+	e := next(t, turn)
+	require.Equal(t, hp.EventRequest, e.Kind)
+	assert.Equal(t, []hp.Option{{ID: "cancel", Label: "Cancel"}}, e.Request.Options)
+	ctx := contextForTest(t)
+	require.ErrorIs(t, turn.Respond(ctx, e.Request.ID, hp.Response{Answers: map[string][]string{"Which?": {"A"}}}), hp.ErrUnsupported)
+	require.ErrorIs(t, turn.Respond(ctx, e.Request.ID, hp.Response{}), hp.ErrUnsupported)
+	require.ErrorIs(t, turn.Respond(ctx, e.Request.ID, hp.Response{OptionID: "decline"}), hp.ErrUnsupported)
+	require.NoError(t, turn.Respond(ctx, e.Request.ID, hp.Response{OptionID: "cancel"}))
+	e = next(t, turn)
+	require.NotNil(t, e.Outcome)
+	assert.Equal(t, hp.OutcomeInterrupted, e.Outcome.Status)
+}
+
 func TestExitAndResumeErrors(t *testing.T) {
 	s := openFake(t, "exit")
 	turn := startFake(t, s)
