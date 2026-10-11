@@ -507,3 +507,21 @@ func TestRedactSecrets(t *testing.T) {
 		})
 	}
 }
+
+func TestStripANSI(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "codex log line", in: "\x1b[2m2026-10-11T02:46:13Z\x1b[0m \x1b[31mERROR\x1b[0m failed", want: "2026-10-11T02:46:13Z ERROR failed"},
+		{name: "plain text kept", in: "x /usr/bin:/bin", want: "x /usr/bin:/bin"},
+		{name: "empty", in: "", want: ""},
+		{name: "multi param", in: "\x1b[1;31mred\x1b[0m", want: "red"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, stripANSI(tt.in))
+		})
+	}
+}
