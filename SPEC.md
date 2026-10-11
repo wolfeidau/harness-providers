@@ -68,45 +68,46 @@ HARNESS_TEST_CODEX_HOME=/path/to/test-codex-home HARNESS_LIVE_TEST=1 \
 
 ## Claude Code provider (planned)
 
-Drives the `claude` CLI directly over its stream-json stdio protocol, the same protocol the Claude Agent SDK uses internally. The [T3 Claude adapter](https://github.com/pingdotgg/t3code) (`ClaudeAdapterV2.ts`) is the reference integration. Frame shapes below must be confirmed against a captured session from the installed CLI before implementation; captured frames become test fixtures.
+Drives the `claude` CLI directly over its stream-json stdio protocol, the same protocol the Claude Agent SDK uses internally. The [T3 Claude adapter](https://github.com/pingdotgg/t3code) (`ClaudeAdapterV2.ts`) is the reference integration. Frame shapes below were captured from `claude` 2.1.296; sanitized captures live in `claude/testdata/` (`>>` lines are sent, `<<` lines received).
 
 - **Configuration.** `claude.Config{Binary, Args, ConfigDir, Env, Logger}`. `ConfigDir` sets `CLAUDE_CONFIG_DIR`; otherwise the child inherits the ambient environment.
-- **Process.** One child per session, in its own process group, started in the workspace as `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --replay-user-messages` plus session, model, effort, and policy flags. A `control_request` with subtype `initialize` precedes the first user message. Launch flags are fixed for the life of a process, so a turn whose model, effort, or policy differs from the running process closes it and respawns with `--resume`. Close and process-group kill follow Codex.
-- **Cursor.** Version 1 holds only `{sessionId}`. A new session generates a UUID and launches with `--session-id`; resume and any respawn after the first turn use `--resume`. The `session_id` in `system/init` must equal the requested ID; a mismatch (the CLI copies a session that is already running) or the CLI's missing-conversation error returns `ErrSessionNotFound`. A cursor whose session never ran a turn has no native state and also returns `ErrSessionNotFound`.
-- **Turns.** The adapter generates the turn ID and sends it as the user message `uuid`. Admission is the replayed user message carrying that UUID; a write failure or no echo before the context ends closes the session. Text parts become text blocks; local images become base64 image blocks (png, jpeg, gif, webp; other types are `ErrUnsupported`). Effort accepts `low`, `medium`, `high`, `xhigh`, `max`.
+- **Process.** One child per session, in its own process group, started in the workspace as `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --replay-user-messages --permission-prompt-tool stdio` plus session, model, effort, and policy flags. Without `--permission-prompt-tool stdio` the CLI denies prompts itself instead of sending `can_use_tool`. A `control_request` with subtype `initialize` precedes the first user message. Launch flags are fixed for the life of a process, so a turn whose model, effort, or policy differs from the running process closes it and respawns with `--resume`. Close and process-group kill follow Codex.
+- **Control frames.** Adapter-initiated requests use adapter-generated `request_id`s and are matched to `control_response`. The CLI echoes the adapter's own `control_response` frames back on stdout; any response whose ID is not outstanding is ignored. Unknown control request subtypes get an error response.
+- **Cursor.** Version 1 holds only `{sessionId}`. A new session generates a UUID and launches with `--session-id`; resume and any respawn after the first turn use `--resume`. `system/init` arrives only with the first turn, so identity is checked there: a `session_id` other than the requested one (the CLI copies a session that is already running) fails the turn and closes the session. A missing session makes the CLI exit before answering `initialize`, with a `result` whose `errors` contain `No conversation found with session ID`; `Open` returns `ErrSessionNotFound`. A session closed before its first turn has no native state, so its cursor also returns `ErrSessionNotFound`. A `--session-id` already on disk fails with `already in use`, reported as a wrapped open error.
+- **Turns.** The adapter generates a fresh UUID per turn, used as the turn ID and the user message `uuid`; the CLI silently completes a reused UUID without running it. Admission is the `command_lifecycle` frame with `state: queued` and `command_uuid` equal to the turn ID; a write failure or no admission before the context ends closes the session. `result.user_message_uuid` correlates the terminal frame. Text parts become text blocks; local images become base64 image blocks (png, jpeg, gif, webp; other types are `ErrUnsupported`). Effort accepts `low`, `medium`, `high`, `xhigh`, `max`.
 - **Events.**
 
   | Claude frame | Event |
   |---|---|
-  | replayed user message | `turn_started` |
-  | `stream_event` text delta | `text_delta`, `ItemID` = message ID |
+  | `command_lifecycle` `queued` | `turn_started` |
+  | `stream_event` `content_block_delta` with `text_delta` | `text_delta`, `ItemID` = `api_message_id` |
   | `assistant` `tool_use` block | `item_started`; kind `command` (Bash), `file_change` (Edit, MultiEdit, Write, NotebookEdit), else `tool` |
-  | `user` `tool_result` block | `item_finished`; `completed`, `failed` on `is_error`, `declined` when the adapter denied it |
-  | `result` | `usage`, then `turn_finished`: `success` → completed; after an interrupt → interrupted; otherwise failed with the result errors |
+  | `user` `tool_result` block | `item_finished`: `declined` when `tool_result_meta.permission_decision.decision` is `reject`, `failed` on `is_error`, else `completed` |
+  | `result` | `usage` (input = input + cache creation + cache read tokens), then `turn_finished` |
 
-  An assistant message with no streamed deltas is emitted from its snapshot, as with Codex.
-- **Requests.** A `control_request` with subtype `can_use_tool` becomes `EventRequest`:
-  - Bash → `command` with the command, workspace as cwd, and the tool's description as reason.
-  - Edit, MultiEdit, Write, NotebookEdit → `file_change` with the target path.
-  - `AskUserQuestion` → `user_input`; answers return as allow with `updatedInput` carrying the original questions and an answers map keyed by question text.
+  Terminal status: `terminal_reason` `aborted_tools` or `aborted_streaming` → interrupted; `is_error` → failed, even when `subtype` is `success` (an authentication failure reports `success` with `is_error: true`); otherwise completed. Failure detail comes from `errors`, skipping `[ede_diagnostic]` entries, else `result`. An assistant message with no streamed deltas is emitted from its snapshot, as with Codex. Other frames (`system` status, `rate_limit_event`, thinking) are ignored.
+- **Requests.** A `control_request` with subtype `can_use_tool` (`tool_name`, `input`, `tool_use_id`) becomes `EventRequest` with `ItemID` = `tool_use_id`:
+  - Bash → `command` with `input.command`, workspace as cwd, and `input.description` as reason.
+  - Edit, MultiEdit, Write, NotebookEdit → `file_change` with `file_path` or `notebook_path`.
+  - `AskUserQuestion` → `user_input`; `Question.ID` is the question text and `Multiple` follows `multiSelect`. Answers return as `allow` with `updatedInput` = the original input plus `answers: {questionText: "a, b"}`.
   - Any other tool → `tool` with the tool name and its input as JSON, truncated at 2 KiB.
 
-  Accept returns `allow` with the original input; decline returns `deny`; cancel returns `deny` with `interrupt: true`. A `control_cancel_request` drops the pending request so a later `Respond` returns `ErrRequestNotFound`. Unknown control subtypes get an error response.
-- **Interrupt.** `control_request` with subtype `interrupt`; the outcome still arrives as `result`.
-- **Policy.** Claude has no per-turn sandbox, so policy maps to tool restriction and permission mode:
+  Accept returns `{behavior: allow, updatedInput: <original input>}`; decline returns `{behavior: deny, message}`; cancel adds `interrupt: true`. `permission_suggestions` are never applied (single-action approvals). A `control_cancel_request` (sent when a turn is interrupted with a request pending) drops it, so a later `Respond` returns `ErrRequestNotFound`.
+- **Interrupt.** `control_request` with subtype `interrupt`; the CLI acknowledges it and the outcome still arrives as `result`.
+- **Policy.** Claude has no per-turn sandbox, so policy maps to launch flags:
 
   | Sandbox \ Approval | default / `on_request` | `never` |
   |---|---|---|
   | default | mode `default`, prompts to host | mode `default`, `--permission-prompts none` |
-  | `read_only` | `--tools Read,Glob,Grep`, mode `dontAsk` | same |
-  | `workspace_write` | mode `acceptEdits`, Bash sandbox enabled via `--settings`, prompts to host | same, `--permission-prompts none` |
+  | `read_only` | `--tools Read,Glob,Grep --strict-mcp-config`, mode `dontAsk` | same |
+  | `workspace_write` | mode `acceptEdits`, `--settings` Bash sandbox, prompts to host | same, `--permission-prompts none` |
   | `unrestricted` | mode `default`, prompts to host | mode `bypassPermissions` |
 
-  If the CLI's sandbox settings cannot confine writes to the workspace, `workspace_write` returns `ErrUnsupported`.
+  `--tools` removes Write, Edit, and Bash from the session entirely; `--strict-mcp-config` is required because account-level claude.ai connectors otherwise remain available. The Bash sandbox settings are `{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true,"allowUnsandboxedCommands":false}}`; captured runs confirm writes inside the workspace succeed and writes to its parent fail with `Operation not permitted`. Like Codex `workspaceWrite`, the system temp directory stays writable.
 
 ### Verification
 
-Deterministic tests mirror the Codex suite with a fake `claude` peer replaying captured frames, plus the policy-to-flags table and respawn on settings change. Live tests use the same tag and opt-in, `claude-haiku-5-5` at `low` effort, and credentials from `HARNESS_TEST_CLAUDE_CONFIG_DIR` or `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` with a temporary config directory; the default `~/.claude` is never used. `TestClaudeReviewE2E` and `TestClaudeApprovalE2E` match the Codex scenarios.
+Deterministic tests mirror the Codex suite with a fake `claude` peer replaying the `claude/testdata` frames, plus the policy-to-flags table and respawn on settings change. Live tests use the same tag and opt-in, `claude-haiku-5-5` at `low` effort, and credentials from `HARNESS_TEST_CLAUDE_CONFIG_DIR` or `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` with a temporary config directory; the default `~/.claude` is never used. `TestClaudeReviewE2E` and `TestClaudeApprovalE2E` match the Codex scenarios.
 
 ## Extension rules
 
