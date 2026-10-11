@@ -154,7 +154,8 @@ func fakeProvider(t *testing.T, scenario string, extraEnv ...string) *Provider {
 	script := filepath.Join(t.TempDir(), "fake-codex")
 	content := "#!/bin/sh\nexec '" + strings.ReplaceAll(bin, "'", "'\\''") + "' -test.run=^TestFakePeer$\n"
 	require.NoError(t, os.WriteFile(script, []byte(content), 0700))
-	return New(Config{Binary: script, Env: append([]string{"HARNESS_FAKE_PEER=1", "HARNESS_FAKE_SCENARIO=" + scenario}, extraEnv...)})
+	// The race runtime sleeps 1s at exit by default, which slows every graceful close.
+	return New(Config{Binary: script, Env: append([]string{"HARNESS_FAKE_PEER=1", "HARNESS_FAKE_SCENARIO=" + scenario, "GORACE=atexit_sleep_ms=0"}, extraEnv...)})
 }
 func contextForTest(t *testing.T) context.Context {
 	t.Helper()
