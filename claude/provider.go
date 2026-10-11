@@ -543,7 +543,7 @@ func (s *session) requestEvent(t *turn, f frame) {
 		r.Kind, r.Options = hp.RequestUserInput, []hp.Option{{ID: optDecline, Label: "Decline"}, {ID: optCancel, Label: "Cancel"}}
 		for i, q := range in.Questions {
 			pending.questions = append(pending.questions, q.Question)
-			question := hp.Question{ID: "q" + strconv.Itoa(i), Header: q.Header, Prompt: q.Question, AllowFreeText: true, Multiple: q.MultiSelect}
+			question := hp.Question{ID: questionID(i), Header: q.Header, Prompt: q.Question, AllowFreeText: true, Multiple: q.MultiSelect}
 			for _, o := range q.Options {
 				question.Options = append(question.Options, hp.Option{ID: o.Label, Label: o.Label, Description: o.Description})
 			}
@@ -656,20 +656,10 @@ func (t *turn) takePending(id string, response hp.Response) (map[string]any, err
 	case response.OptionID == optCancel:
 		result = map[string]any{fieldBehavior: "deny", "message": "User canceled tool execution.", "interrupt": true}
 	case p.tool == toolAskUser && response.OptionID == "":
-		input := map[string]any{}
-		if err := json.Unmarshal(p.input, &input); err != nil {
-			return nil, fmt.Errorf("claude decode question input: %w", err)
+		input, err := p.answered(response.Answers)
+		if err != nil {
+			return nil, err
 		}
-		answers := map[string]string{}
-		for i, text := range p.questions {
-			if v := response.Answers["q"+strconv.Itoa(i)]; len(v) > 0 {
-				if prev, ok := answers[text]; ok {
-					v = append([]string{prev}, v...)
-				}
-				answers[text] = strings.Join(v, ", ")
-			}
-		}
-		input["answers"] = answers
 		result = map[string]any{fieldBehavior: "allow", "updatedInput": input}
 	case p.tool != toolAskUser && response.OptionID == optAccept:
 		result = map[string]any{fieldBehavior: "allow", "updatedInput": p.input}
@@ -678,6 +668,34 @@ func (t *turn) takePending(id string, response hp.Response) (map[string]any, err
 	}
 	delete(t.pending, id)
 	return result, nil
+}
+
+func questionID(i int) string { return "q" + strconv.Itoa(i) }
+
+func (p pendingRequest) answered(response map[string][]string) (map[string]any, error) {
+	input := map[string]any{}
+	if err := json.Unmarshal(p.input, &input); err != nil {
+		return nil, fmt.Errorf("claude decode question input: %w", err)
+	}
+	answers := map[string]string{}
+	used := 0
+	for i, text := range p.questions {
+		v, ok := response[questionID(i)]
+		if ok {
+			used++
+		}
+		if len(v) > 0 {
+			if prev, ok := answers[text]; ok {
+				v = append([]string{prev}, v...)
+			}
+			answers[text] = strings.Join(v, ", ")
+		}
+	}
+	if used != len(response) {
+		return nil, fmt.Errorf("claude answers name unknown question IDs: %w", hp.ErrUnsupported)
+	}
+	input["answers"] = answers
+	return input, nil
 }
 
 func (t *turn) Interrupt(ctx context.Context) error {

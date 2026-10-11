@@ -15,9 +15,9 @@ The contract covers starting or resuming a native conversation, running one turn
 
 The contract lives in [`provider.go`](provider.go) (`package harnessproviders`), which is the source of truth for type names and fields. In outline: a `Provider` opens a `Session` from an `OpenRequest` (workspace plus optional `Cursor`); a `Session` starts at most one `Turn` at a time from a `TurnInput` (parts, model, effort, `ExecutionPolicy`); a `Turn` yields `Event`s and accepts `Respond` and `Interrupt`.
 
-String enumerations are closed for inputs; adapters validate them before any native call and return `ErrUnsupported` for values they cannot honour rather than weakening a requested policy. Consumers must tolerate unknown future `EventKind` values. `Item.Kind` is descriptive and never drives authorization. Approval decisions come only from the chosen `Option` (accept, decline, cancel); the `Approval` display fields never decide anything. Approvals are single-action: no session-wide grants or policy amendments.
+String enumerations are closed for inputs; adapters validate them before any native call and return `ErrUnsupported` for values they cannot honour rather than weakening a requested policy. Consumers must tolerate unknown future `EventKind` values. `Item.Kind` is descriptive and never drives authorization. Approval decisions come only from the chosen `Option` (accept, decline, cancel); the `Approval` display fields never decide anything. A `user_input` request is answered with an empty `OptionID` and `Answers` keyed by `Question.ID`. Its `Options`, when present, offer decline or cancel instead of answering (Claude does; Codex offers none). Approvals are single-action: no session-wide grants or policy amendments.
 
-`Approval.Action` is one of `command`, `file_change`, `write_stdin`, or `tool`. `tool` covers any other harness tool (web fetch, MCP, subagents); `Approval.Tool` names it and `Command` carries a bounded summary of its input.
+`Approval.Action` is one of `command`, `file_change`, `write_stdin`, or `tool`. `tool` covers any other harness tool (web fetch, MCP, subagents); `Approval.Tool` names it and `Command` carries its full input.
 
 ### Contract semantics
 
@@ -89,7 +89,7 @@ Drives the `claude` CLI directly over its stream-json stdio protocol, the same p
 - **Requests.** A `control_request` with subtype `can_use_tool` (`tool_name`, `input`, `tool_use_id`) becomes `EventRequest` with `ItemID` = `tool_use_id`:
   - Bash → `command` with `input.command`, workspace as cwd (accurate because Bash is pinned to the workspace), and `input.description` as reason.
   - Edit, MultiEdit, Write, NotebookEdit → `file_change` with `file_path` or `notebook_path`.
-  - `AskUserQuestion` → `user_input` with options decline and cancel; `Question.ID` is the index (`q0`, `q1`, …) so repeated question text stays distinct, and `Multiple` follows `multiSelect`. A response with no `OptionID` returns `allow` with `updatedInput` = the original input plus `answers: {questionText: "a, b"}`; answers to repeated text are joined. Decline and cancel deny as for approvals.
+  - `AskUserQuestion` → `user_input` with options decline and cancel; `Question.ID` is the index (`q0`, `q1`, …) so repeated question text stays distinct, and `Multiple` follows `multiSelect`. A response with no `OptionID` returns `allow` with `updatedInput` = the original input plus `answers: {questionText: "a, b"}`; answers to repeated text are joined. An unknown question ID returns `ErrUnsupported` and leaves the request pending. Decline and cancel deny as for approvals.
   - Any other tool → `tool` with the tool name and its full input as JSON; it is never truncated, so the approver sees everything that runs.
 
   Accept returns `{behavior: allow, updatedInput: <original input>}`; decline returns `{behavior: deny, message}`; cancel adds `interrupt: true`. `permission_suggestions` are never applied (single-action approvals). A `control_cancel_request` (sent when a turn is interrupted with a request pending) drops it, so a later `Respond` returns `ErrRequestNotFound`; requests still pending when the turn finishes are dropped the same way.

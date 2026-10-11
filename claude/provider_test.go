@@ -698,6 +698,19 @@ func TestAskUserQuestionDecline(t *testing.T) {
 	collect(t, turn)
 }
 
+func TestAskUserQuestionCancel(t *testing.T) {
+	s, logs := openFake(t, "question")
+	turn := startFake(t, s)
+	req := nextRequest(t, turn)
+	require.ErrorIs(t, turn.Respond(contextForTest(t), req.ID, hp.Response{Answers: map[string][]string{"Which colour?": {"Red"}}}), hp.ErrUnsupported)
+	require.NoError(t, turn.Respond(contextForTest(t), req.ID, hp.Response{OptionID: "cancel"}))
+	sent := logs.received(t, func(m map[string]any) bool { return m["type"] == "control_response" })
+	payload := sent["response"].(map[string]any)["response"].(map[string]any)
+	assert.Equal(t, "deny", payload["behavior"])
+	assert.Equal(t, true, payload["interrupt"])
+	collect(t, turn)
+}
+
 func TestAskUserQuestionDuplicateText(t *testing.T) {
 	s, logs := openFake(t, "duplicate_question")
 	turn := startFake(t, s)
@@ -992,6 +1005,8 @@ func TestEnvironmentConfigDir(t *testing.T) {
 	assert.Contains(t, explicit, "CLAUDE_CONFIG_DIR=/explicit")
 	assert.NotContains(t, explicit, "CLAUDE_CONFIG_DIR=/ambient")
 	assert.Contains(t, explicit, "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1")
+	overridden := environment("", []string{"CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=0"})
+	assert.Equal(t, "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1", overridden[len(overridden)-1])
 }
 
 func TestOpenRejectsFileWorkspace(t *testing.T) {

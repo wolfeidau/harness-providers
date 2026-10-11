@@ -412,9 +412,9 @@ func environment(configDir string, extra []string) []string {
 			env = append(env, v)
 		}
 	}
-	// Pins each Bash call to the workspace so Approval.Cwd stays accurate after a cd.
-	env = append(env, "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1")
 	env = append(env, extra...)
+	// Last so Env cannot unpin Bash from the workspace and make Approval.Cwd stale.
+	env = append(env, "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1")
 	if configDir != "" {
 		env = append(env, "CLAUDE_CONFIG_DIR="+configDir)
 	}
