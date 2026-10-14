@@ -15,6 +15,9 @@ steps:
         plugins:
           - mise#v1.1.5:
               install_args: go
-        command: bash .buildkite/test.sh
+          - wolfeidau/go-test-annotate#v1.0.0:
+              file: tests.json
+        command: go test -count=1 -json -coverprofile=coverage.out ./... > tests.json
         artifact_paths:
-          - ".buildkite/results/*"
+          - coverage.out
+          - tests.json
